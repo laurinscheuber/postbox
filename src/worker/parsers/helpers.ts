@@ -16,20 +16,87 @@ export function inferFolderKind(name: string): FolderKind {
   return 'custom';
 }
 
+const HTML_NAMED_ENTITIES: Readonly<Record<string, string>> = {
+  auml: 'ä',
+  ouml: 'ö',
+  uuml: 'ü',
+  Auml: 'Ä',
+  Ouml: 'Ö',
+  Uuml: 'Ü',
+  szlig: 'ß',
+  euro: '€',
+  eacute: 'é',
+  Eacute: 'É',
+  egrave: 'è',
+  Egrave: 'È',
+  ecirc: 'ê',
+  Ecirc: 'Ê',
+  euml: 'ë',
+  agrave: 'à',
+  Agrave: 'À',
+  acirc: 'â',
+  aring: 'å',
+  Aring: 'Å',
+  ccedil: 'ç',
+  Ccedil: 'Ç',
+  ntilde: 'ñ',
+  Ntilde: 'Ñ',
+  oslash: 'ø',
+  Oslash: 'Ø',
+  ugrave: 'ù',
+  ucirc: 'û',
+  yuml: 'ÿ',
+  ndash: '–',
+  mdash: '—',
+  lsquo: '‘',
+  rsquo: '’',
+  sbquo: '‚',
+  ldquo: '“',
+  rdquo: '”',
+  bdquo: '„',
+  laquo: '«',
+  raquo: '»',
+  hellip: '…',
+  bull: '•',
+  copy: '©',
+  reg: '®',
+  trade: '™',
+  sect: '§',
+  deg: '°',
+  apos: "'",
+  nbsp: ' ',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  amp: '&',
+};
+
+export function decodeHtmlEntities(input: string): string {
+  if (!input || !input.includes('&')) return input;
+  return input.replace(/&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z]+);/g, (full, body: string) => {
+    if (body[0] === '#') {
+      const cp =
+        body[1] === 'x' || body[1] === 'X'
+          ? parseInt(body.slice(2), 16)
+          : parseInt(body.slice(1), 10);
+      if (Number.isFinite(cp) && cp >= 1 && cp <= 0x10ffff) {
+        return String.fromCodePoint(cp);
+      }
+      return full;
+    }
+    return HTML_NAMED_ENTITIES[body] ?? full;
+  });
+}
+
 export function stripHtmlToText(html: string): string {
   if (!html) return '';
-  return html
+  const stripped = html
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/(p|div|li|tr|h[1-6])>/gi, '\n')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
+    .replace(/<[^>]+>/g, ' ');
+  return decodeHtmlEntities(stripped)
     .replace(/[ \t]+/g, ' ')
     .replace(/\n\s*\n+/g, '\n')
     .trim();

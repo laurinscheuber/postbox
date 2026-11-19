@@ -4,6 +4,7 @@ import { ReadingPane } from './ReadingPane';
 import type {
   FolderNode,
   MessageDetail,
+  MessageSortOrder,
   MessageSummary,
   SearchFilter,
 } from '../types/mail';
@@ -16,6 +17,8 @@ interface MailWorkspaceProps {
   selectedMessageId: string | null;
   activeDetail: MessageDetail | null;
   filter: SearchFilter;
+  sortOrder: MessageSortOrder;
+  sortAnnouncement: string;
   theme: 'light' | 'dark';
   isFolderLoading: boolean;
   scanProgress: ListScanProgress | null;
@@ -27,6 +30,7 @@ interface MailWorkspaceProps {
   onSelectFolder: (folderId: string) => void;
   onSelectMessage: (messageId: string) => void;
   onFilterChange: (next: Partial<SearchFilter>) => void;
+  onToggleSortOrder: () => void;
   onCancelScan: () => void;
   onExportEml: (messageId: string) => void;
   onExportFolderZip: () => void;
@@ -42,6 +46,8 @@ export function MailWorkspace({
   selectedMessageId,
   activeDetail,
   filter,
+  sortOrder,
+  sortAnnouncement,
   theme,
   isFolderLoading,
   scanProgress,
@@ -53,6 +59,7 @@ export function MailWorkspace({
   onSelectFolder,
   onSelectMessage,
   onFilterChange,
+  onToggleSortOrder,
   onCancelScan,
   onExportEml,
   onExportFolderZip,
@@ -104,11 +111,14 @@ export function MailWorkspace({
           messages={messages}
           selectedMessageId={selectedMessageId}
           filter={filter}
+          sortOrder={sortOrder}
+          sortAnnouncement={sortAnnouncement}
           isLoading={isFolderLoading}
           scanProgress={scanProgress}
           isExportingZip={isExportingZip}
           onSelectMessage={onSelectMessage}
           onFilterChange={onFilterChange}
+          onToggleSortOrder={onToggleSortOrder}
           onCancelScan={onCancelScan}
           onExportFolderZip={onExportFolderZip}
         />

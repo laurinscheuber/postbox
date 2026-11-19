@@ -6,6 +6,8 @@ import type {
   MessageDetail,
   MessageSummary,
 } from '../../types/mail';
+import { decodeMimeWords, decodeSmartTextBytes } from '../../utils/encoding';
+import { compareMessagesByDate } from '../../utils/sortMessages';
 import {
   buildSnippet,
   formatToSummary,
@@ -15,7 +17,6 @@ import {
   stripHtmlToText,
 } from './helpers';
 
-const textDecoder = new TextDecoder('utf-8', { fatal: false });
 const textEncoder = new TextEncoder();
 
 export interface ParsedEmlRecord {
@@ -44,10 +45,16 @@ function flattenAddresses(list: Address[] | undefined): EmailAddress[] {
   for (const item of list) {
     if ('group' in item && Array.isArray(item.group)) {
       for (const member of item.group) {
-        out.push({ name: member.name || '', address: member.address || '' });
+        out.push({
+          name: decodeMimeWords(member.name || ''),
+          address: member.address || '',
+        });
       }
     } else {
-      out.push({ name: item.name || '', address: item.address || '' });
+      out.push({
+        name: decodeMimeWords(item.name || ''),
+        address: item.address || '',
+      });
     }
   }
   return out;
@@ -88,7 +95,7 @@ function convertPostalMimeEmail(
   const bcc = flattenAddresses(parsed.bcc);
 
   const { iso, timestamp } = parseDateSafe(parsed.date ?? meta.fallbackTimestamp);
-  const subject = (parsed.subject || meta.fallbackSubject || '(No Subject)').trim();
+  const subject = decodeMimeWords((parsed.subject || meta.fallbackSubject || '(No Subject)').trim());
   const htmlBody = parsed.html || '';
   const textBody = (parsed.text || '').trim() || (htmlBody ? stripHtmlToText(htmlBody) : '');
   const toSummary = formatToSummary(to);
@@ -150,7 +157,7 @@ export async function parseEmlFile(
   folderId: string,
 ): Promise<ParsedEmlRecord> {
   const buf = await file.arrayBuffer();
-  const rawText = textDecoder.decode(new Uint8Array(buf));
+  const rawText = decodeSmartTextBytes(new Uint8Array(buf));
   const parsed = await PostalMime.parse(buf);
   return convertPostalMimeEmail(parsed, rawText, {
     id: `${archiveId}:eml:0`,
@@ -164,8 +171,53 @@ export async function parseEmlFile(
   });
 }
 
-function unescapeMboxFromLines(raw: string): string {
-  return raw.replace(/^>(>*From )/gm, '$1');
+/**
+ * Strips one leading '>' on mboxrd-escaped lines (`^>(>*From )`) at the raw byte level so
+ * non-UTF-8 8-bit MIME parts (e.g. ISO-8859-1 / Windows-1252) are preserved intact for PostalMime.
+ */
+function unescapeMboxFromBytes(bytes: Uint8Array): Uint8Array {
+  const stripIndices: number[] = [];
+  let lineStart = 0;
+
+  while (lineStart < bytes.length) {
+    if (bytes[lineStart] === 0x3e) {
+      let pos = lineStart + 1;
+      while (pos < bytes.length && bytes[pos] === 0x3e) {
+        pos += 1;
+      }
+      if (
+        pos + 5 <= bytes.length &&
+        bytes[pos] === 0x46 && // F
+        bytes[pos + 1] === 0x72 && // r
+        bytes[pos + 2] === 0x6f && // o
+        bytes[pos + 3] === 0x6d && // m
+        bytes[pos + 4] === 0x20 // ' '
+      ) {
+        stripIndices.push(lineStart);
+      }
+    }
+
+    const nlIdx = bytes.indexOf(0x0a, lineStart);
+    if (nlIdx === -1) break;
+    lineStart = nlIdx + 1;
+  }
+
+  if (stripIndices.length === 0) return bytes;
+
+  const out = new Uint8Array(bytes.length - stripIndices.length);
+  let srcCursor = 0;
+  let dstCursor = 0;
+  for (const dropIdx of stripIndices) {
+    if (dropIdx > srcCursor) {
+      out.set(bytes.subarray(srcCursor, dropIdx), dstCursor);
+      dstCursor += dropIdx - srcCursor;
+    }
+    srcCursor = dropIdx + 1;
+  }
+  if (srcCursor < bytes.length) {
+    out.set(bytes.subarray(srcCursor), dstCursor);
+  }
+  return out;
 }
 
 function findNextFromLine(bytes: Uint8Array, fromPos: number): number {
@@ -216,8 +268,14 @@ export async function indexMboxFile(
 
     let cursor = 0;
     if (offset === 0) {
-      const head = textDecoder.decode(bytes.subarray(0, Math.min(5, bytes.length)));
-      if (head === 'From ') {
+      const startsWithFrom =
+        bytes.length >= 5 &&
+        bytes[0] === 0x46 &&
+        bytes[1] === 0x72 &&
+        bytes[2] === 0x6f &&
+        bytes[3] === 0x6d &&
+        bytes[4] === 0x20;
+      if (startsWithFrom) {
         currentMsgStart = findLineEnd(bytes, 0);
         cursor = currentMsgStart;
       } else {
@@ -258,12 +316,12 @@ export async function indexMboxFile(
     // Read small header/preamble slice only so multi-GB mbox indexing stays lightweight
     const previewBytesLen = Math.min(spanSize, 64 * 1024);
     const previewBuf = await file.slice(span.start, span.start + previewBytesLen).arrayBuffer();
-    const previewRaw = unescapeMboxFromLines(textDecoder.decode(new Uint8Array(previewBuf)));
+    const previewBytes = unescapeMboxFromBytes(new Uint8Array(previewBuf));
 
     let summary: MessageSummary;
     try {
-      const parsed = await PostalMime.parse(previewRaw);
-      const converted = convertPostalMimeEmail(parsed, previewRaw, {
+      const parsed = await PostalMime.parse(previewBytes);
+      const converted = convertPostalMimeEmail(parsed, '', {
         id: msgId,
         folderId,
         folderPath: file.name,
@@ -303,7 +361,7 @@ export async function indexMboxFile(
     });
   }
 
-  messages.sort((a, b) => b.timestamp - a.timestamp);
+  messages.sort((a, b) => compareMessagesByDate(a, b, 'desc'));
 
   const folderNode: FolderNode = {
     id: folderId,
@@ -334,8 +392,9 @@ export async function loadMboxMessageDetail(
   if (!span) return null;
 
   const buf = await session.file.slice(span.start, span.end).arrayBuffer();
-  const rawSource = unescapeMboxFromLines(textDecoder.decode(new Uint8Array(buf)));
-  const parsed = await PostalMime.parse(rawSource);
+  const unescapedBytes = unescapeMboxFromBytes(new Uint8Array(buf));
+  const rawSource = decodeSmartTextBytes(unescapedBytes);
+  const parsed = await PostalMime.parse(unescapedBytes);
 
   const { detail } = convertPostalMimeEmail(parsed, rawSource, {
     id: messageId,
@@ -358,7 +417,7 @@ export async function readMboxMessageBodyText(
   const span = session.spansById.get(messageId);
   if (!span) return '';
   const buf = await session.file.slice(span.start, span.end).arrayBuffer();
-  const rawSource = unescapeMboxFromLines(textDecoder.decode(new Uint8Array(buf)));
-  const parsed = await PostalMime.parse(rawSource);
+  const unescapedBytes = unescapeMboxFromBytes(new Uint8Array(buf));
+  const parsed = await PostalMime.parse(unescapedBytes);
   return (parsed.text || '').trim() || (parsed.html ? stripHtmlToText(parsed.html) : '');
 }

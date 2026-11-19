@@ -6,6 +6,7 @@ import type {
   MessageDetail,
   MessageSummary,
 } from '../../types/mail';
+import { decodeMimeWords, decodeSmartHtmlBytes } from '../../utils/encoding';
 import {
   buildSnippet,
   formatToSummary,
@@ -15,20 +16,34 @@ import {
   stripHtmlToText,
 } from './helpers';
 
-const textDecoder = new TextDecoder('utf-8', { fatal: false });
-
 export interface ParsedMsgRecord {
   summary: MessageSummary;
   detail: MessageDetail;
   searchText: string;
 }
 
+function getMsgCodepageHint(data: FieldsData): number | undefined {
+  let internetCp: number | undefined;
+  let messageCp: number | undefined;
+  for (const prop of data.rawProps ?? []) {
+    const tag = prop.propertyTag?.toLowerCase();
+    if (tag === '3fde0003' && typeof prop.value === 'number' && prop.value > 0) {
+      internetCp = prop.value;
+    } else if (tag === '3ffd0003' && typeof prop.value === 'number' && prop.value > 0) {
+      messageCp = prop.value;
+    }
+  }
+  return internetCp ?? messageCp;
+}
+
 function decodeHtmlField(data: FieldsData): string {
+  const codepageHint = getMsgCodepageHint(data);
+  if (data.html instanceof Uint8Array && data.html.byteLength > 0) {
+    const decoded = decodeSmartHtmlBytes(data.html, codepageHint);
+    if (decoded.trim()) return decoded;
+  }
   if (data.bodyHtml && data.bodyHtml.trim()) {
     return data.bodyHtml;
-  }
-  if (data.html instanceof Uint8Array && data.html.byteLength > 0) {
-    return textDecoder.decode(data.html);
   }
   return '';
 }
@@ -43,7 +58,7 @@ function mapMsgRecipients(recipients: FieldsData[] | undefined): {
   const bcc: EmailAddress[] = [];
   for (const r of recipients ?? []) {
     const addr: EmailAddress = {
-      name: (r.name || '').trim(),
+      name: decodeMimeWords((r.name || '').trim()),
       address: (r.smtpAddress || r.email || '').trim(),
     };
     if (r.recipType === 'cc') {
@@ -100,7 +115,8 @@ export async function parseMsgFile(
     data.senderEmail ||
     ''
   ).trim();
-  const senderName = (data.senderName || senderAddress || 'Unknown Sender').trim();
+  const senderName =
+    decodeMimeWords((data.senderName || '').trim()) || senderAddress || 'Unknown Sender';
   const { to, cc, bcc } = mapMsgRecipients(data.recipients);
   const { iso, timestamp } = parseDateSafe(
     data.messageDeliveryTime ?? data.clientSubmitTime ?? data.creationTime ?? file.lastModified,
@@ -108,7 +124,10 @@ export async function parseMsgFile(
 
   const htmlBody = decodeHtmlField(data);
   const textBody = (data.body || '').trim() || (htmlBody ? stripHtmlToText(htmlBody) : '');
-  const subject = (data.subject || file.name.replace(/\.msg$/i, '') || '(No Subject)').trim();
+  const subject =
+    decodeMimeWords((data.subject || '').trim()) ||
+    file.name.replace(/\.msg$/i, '') ||
+    '(No Subject)';
   const toSummary = formatToSummary(to);
 
   const attachments: AttachmentItem[] = [];

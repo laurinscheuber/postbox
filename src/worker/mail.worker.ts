@@ -10,6 +10,7 @@ import type {
   WorkerResponse,
 } from '../types/mail';
 import { sanitizeExportFilename, serializeMessageToEml } from '../utils/emlSerializer';
+import { sortMessages } from '../utils/sortMessages';
 import {
   indexMboxFile,
   loadMboxMessageDetail,
@@ -97,7 +98,7 @@ function getImportedSummaries(): MessageSummary[] {
     const rec = importedRecords.get(id);
     if (rec) list.push(rec.summary);
   }
-  return list.sort((a, b) => b.timestamp - a.timestamp);
+  return sortMessages(list, 'desc');
 }
 
 function countPstTotalMessages(session: PstArchiveSession): number {
@@ -486,7 +487,7 @@ async function collectAllFolderHeadersForExport(folderId: string): Promise<Messa
       out.push(...batch);
     },
   });
-  return out;
+  return sortMessages(out, 'desc');
 }
 
 async function handleLoadFiles(requestId: string, files: File[]): Promise<void> {

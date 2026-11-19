@@ -8,6 +8,12 @@ import type {
   MessageDetail,
   MessageSummary,
 } from '../../types/mail';
+import {
+  decodeMimeWords,
+  decodeSmartHtmlBytes,
+  extractRtfBody,
+} from '../../utils/encoding';
+import { sortMessages } from '../../utils/sortMessages';
 import { toMapiPropertyItem } from '../mapiTags';
 import { createPstBlockReader } from '../pstBlockReader';
 import {
@@ -69,14 +75,16 @@ const HEADER_KEYS = new Set<number>([
   0x0e1d, // PR_NORMALIZED_SUBJECT
   0x3001, // PR_DISPLAY_NAME
   0x3007, // PR_CREATION_TIME
+  0x3008, // PR_LAST_MODIFICATION_TIME
+  0x3fde, // PidTagInternetCodepage
+  0x3ffd, // PidTagMessageCodepage
   0x5d01, // PR_SENDER_SMTP_ADDRESS
   0x5d02, // PR_SENT_REPRESENTING_SMTP_ADDRESS
   0x67f2, // PidTagLtpRowId
 ]);
 
-const BODY_KEYS = new Set<number>([0x1000, 0x1013]);
+const BODY_KEYS = new Set<number>([0x1000, 0x1013, 0x3fde, 0x3ffd]);
 
-const textDecoder = new TextDecoder('utf-8', { fatal: false });
 const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 function cleanSubjectPrefix(raw: string): string {
@@ -148,28 +156,30 @@ function buildSummaryFromProps(
   },
 ): MessageSummary {
   const rawSubject =
-    cleanSubjectPrefix(getStr(props, 0x0037)) ||
-    getStr(props, 0x0e1d) ||
-    getStr(props, 0x3001) ||
-    getStr(props, 0x0070) ||
-    '(No Subject)';
+    decodeMimeWords(
+      cleanSubjectPrefix(getStr(props, 0x0037)) ||
+        getStr(props, 0x0e1d) ||
+        getStr(props, 0x3001) ||
+        getStr(props, 0x0070),
+    ) || '(No Subject)';
 
   const smtp = getStr(props, 0x5d01) || getStr(props, 0x5d02);
   const rawAddr = getStr(props, 0x0c1f) || getStr(props, 0x0065);
   const senderAddress = (smtp.includes('@') ? smtp : rawAddr) || '';
   const senderName =
-    getStr(props, 0x0c1a) ||
-    getStr(props, 0x0042) ||
+    decodeMimeWords(getStr(props, 0x0c1a) || getStr(props, 0x0042)) ||
     senderAddress ||
     'Unknown Sender';
 
   const deliveryTime = props.get(0x0e06);
   const submitTime = props.get(0x0039);
   const creationTime = props.get(0x3007);
+  const modificationTime = props.get(0x3008);
   const { iso, timestamp } = parseDateSafe(
     (deliveryTime instanceof Date ? deliveryTime : null) ??
       (submitTime instanceof Date ? submitTime : null) ??
-      (creationTime instanceof Date ? creationTime : null),
+      (creationTime instanceof Date ? creationTime : null) ??
+      (modificationTime instanceof Date ? modificationTime : null),
   );
 
   const flags = getNum(props, 0x0e07);
@@ -186,7 +196,7 @@ function buildSummaryFromProps(
     subject: rawSubject,
     senderName,
     senderAddress,
-    toSummary: getStr(props, 0x0e04) || getStr(props, 0x0040),
+    toSummary: decodeMimeWords(getStr(props, 0x0e04) || getStr(props, 0x0040)),
     date: iso,
     timestamp,
     snippet: '',
@@ -219,7 +229,7 @@ export async function openPstArchive(
   onProgress?: (label: string) => void,
 ): Promise<{ session: PstArchiveSession; defaultFolderId: string | null }> {
   const reader = createPstBlockReader(file);
-  const engine = await PstEngine.open(reader, 'latin1');
+  const engine = await PstEngine.open(reader, 'windows-1252');
 
   const foldersById = new Map<string, PstFolderMeta>();
   const allFolderIds: string[] = [];
@@ -479,6 +489,11 @@ export async function streamPstFolderHeaders(
           tableSchemaKeys.has(0x5d01) ||
           tableSchemaKeys.has(0x0c1f) ||
           tableSchemaKeys.has(0x0e04);
+        const hasDateCol =
+          tableSchemaKeys.has(0x0e06) ||
+          tableSchemaKeys.has(0x0039) ||
+          tableSchemaKeys.has(0x3007) ||
+          tableSchemaKeys.has(0x3008);
 
         const rowEntries: Array<{ rowNid: number; rowMap: Map<number, unknown>; needsFallback: boolean }> = [];
         for (let idx = 0; idx < rows.length; idx += 1) {
@@ -496,11 +511,17 @@ export async function streamPstFolderHeaders(
               !rowMap.get(0x5d01) &&
               !rowMap.get(0x0c1f) &&
               !rowMap.get(0x0e04));
+          const missingDate =
+            !hasDateCol ||
+            (!(rowMap.get(0x0e06) instanceof Date) &&
+              !(rowMap.get(0x0039) instanceof Date) &&
+              !(rowMap.get(0x3007) instanceof Date) &&
+              !(rowMap.get(0x3008) instanceof Date));
 
           rowEntries.push({
             rowNid,
             rowMap,
-            needsFallback: missingSubject || missingSenderAndTo,
+            needsFallback: missingSubject || missingSenderAndTo || missingDate,
           });
         }
 
@@ -565,7 +586,7 @@ export async function streamPstFolderHeaders(
       handledByTable = true;
       meta.node.totalCount = total;
       if (canCache) {
-        storeCachedFolderHeaders(session, folderId, collected);
+        storeCachedFolderHeaders(session, folderId, sortMessages(collected, 'desc'));
       }
       return { total, cancelled: false };
     }
@@ -621,12 +642,20 @@ export async function streamPstFolderHeaders(
     }
 
     if (canCache) {
-      storeCachedFolderHeaders(session, folderId, collected);
+      storeCachedFolderHeaders(session, folderId, sortMessages(collected, 'desc'));
     }
     return { total, cancelled: false };
   }
 
   return { total: 0, cancelled: false };
+}
+
+function getMsgCodepage(msg: IPSTMessage): number | undefined {
+  const internetCp = msg.getProperty(0x3fde)?.value;
+  if (typeof internetCp === 'number' && internetCp > 0) return internetCp;
+  const msgCp = msg.getProperty(0x3ffd)?.value;
+  if (typeof msgCp === 'number' && msgCp > 0) return msgCp;
+  return undefined;
 }
 
 /**
@@ -646,6 +675,11 @@ export async function readPstMessageBodyText(
     `body(${msgNid})`,
   );
   const props = await session.engine.readProperties(subNode, BODY_KEYS);
+  const cpVal =
+    props.find((p) => p.key === 0x3fde)?.value ??
+    props.find((p) => p.key === 0x3ffd)?.value;
+  const codepageHint = typeof cpVal === 'number' && cpVal > 0 ? cpVal : undefined;
+
   const textProp = props.find((p) => p.key === 0x1000)?.value;
   if (typeof textProp === 'string' && textProp.trim()) {
     return textProp;
@@ -655,7 +689,18 @@ export async function readPstMessageBodyText(
     return stripHtmlToText(htmlProp);
   }
   if (htmlProp instanceof ArrayBuffer && htmlProp.byteLength > 0) {
-    return stripHtmlToText(textDecoder.decode(new Uint8Array(htmlProp)));
+    return stripHtmlToText(decodeSmartHtmlBytes(new Uint8Array(htmlProp), codepageHint));
+  }
+  if (htmlProp instanceof Uint8Array && htmlProp.byteLength > 0) {
+    return stripHtmlToText(decodeSmartHtmlBytes(htmlProp, codepageHint));
+  }
+
+  // Fallback for RTF-only messages (`0x1009`) when both plain text and HTML are absent
+  const msg = await session.engine.openMessageByNid(msgNid);
+  if (msg && msg.getProperty(0x1009)?.value && msg.bodyRTF) {
+    const rtf = extractRtfBody(msg.bodyRTF, getMsgCodepage(msg) ?? codepageHint);
+    if (rtf.text) return rtf.text;
+    if (rtf.html) return stripHtmlToText(rtf.html);
   }
   return '';
 }
@@ -675,16 +720,19 @@ function extractBestSenderEmail(msg: IPSTMessage): string {
 }
 
 function extractPstHtmlBody(msg: IPSTMessage): string {
+  const rawHtmlProp = msg.getProperty(0x1013)?.value;
+  if (rawHtmlProp instanceof ArrayBuffer && rawHtmlProp.byteLength > 0) {
+    return decodeSmartHtmlBytes(new Uint8Array(rawHtmlProp), getMsgCodepage(msg));
+  }
+  if (rawHtmlProp instanceof Uint8Array && rawHtmlProp.byteLength > 0) {
+    return decodeSmartHtmlBytes(rawHtmlProp, getMsgCodepage(msg));
+  }
+  if (typeof rawHtmlProp === 'string' && rawHtmlProp.trim()) {
+    return rawHtmlProp;
+  }
   const htmlStr = msg.bodyHTML;
   if (htmlStr && htmlStr.trim()) {
     return htmlStr;
-  }
-  const rawHtmlProp = msg.getProperty(0x1013)?.value;
-  if (rawHtmlProp instanceof ArrayBuffer && rawHtmlProp.byteLength > 0) {
-    return textDecoder.decode(new Uint8Array(rawHtmlProp));
-  }
-  if (rawHtmlProp instanceof Uint8Array && rawHtmlProp.byteLength > 0) {
-    return textDecoder.decode(rawHtmlProp);
   }
   return '';
 }
@@ -700,7 +748,7 @@ function mapRecipients(recipients: IPSTRecipient[], msg: IPSTMessage): {
 
   for (const r of recipients) {
     const addr: EmailAddress = {
-      name: (r.displayName || '').trim(),
+      name: decodeMimeWords((r.displayName || '').trim()),
       address: (r.smtpAddress || r.emailAddress || '').trim(),
     };
     if (r.recipientType === Consts.MAPI_CC) {
@@ -713,13 +761,13 @@ function mapRecipients(recipients: IPSTRecipient[], msg: IPSTMessage): {
   }
 
   if (to.length === 0 && msg.displayTo) {
-    to.push(...parseAddressStringList(msg.displayTo));
+    to.push(...parseAddressStringList(decodeMimeWords(msg.displayTo)));
   }
   if (cc.length === 0 && msg.displayCC) {
-    cc.push(...parseAddressStringList(msg.displayCC));
+    cc.push(...parseAddressStringList(decodeMimeWords(msg.displayCC)));
   }
   if (bcc.length === 0 && msg.displayBCC) {
-    bcc.push(...parseAddressStringList(msg.displayBCC));
+    bcc.push(...parseAddressStringList(decodeMimeWords(msg.displayBCC)));
   }
 
   return { to, cc, bcc };
@@ -790,14 +838,27 @@ export async function loadPstMessageDetail(
 
   const { to, cc, bcc } = mapRecipients(recipients, msg);
   const senderAddress = extractBestSenderEmail(msg);
-  const senderName = (msg.senderName || msg.sentRepresentingName || senderAddress || 'Unknown Sender').trim();
-  const htmlBody = extractPstHtmlBody(msg);
-  const textBody = msg.body || (htmlBody ? stripHtmlToText(htmlBody) : '');
+  const senderName =
+    decodeMimeWords((msg.senderName || msg.sentRepresentingName || '').trim()) ||
+    senderAddress ||
+    'Unknown Sender';
+  let htmlBody = extractPstHtmlBody(msg);
+  let rtfText = '';
+  if ((!htmlBody || !(msg.body || '').trim()) && msg.getProperty(0x1009)?.value && msg.bodyRTF) {
+    const rtf = extractRtfBody(msg.bodyRTF, getMsgCodepage(msg));
+    if (!htmlBody && rtf.html) htmlBody = rtf.html;
+    if (rtf.text) rtfText = rtf.text;
+  }
+  const textBody = (msg.body || '').trim() ? msg.body : rtfText || (htmlBody ? stripHtmlToText(htmlBody) : '');
   const attachments = await extractAttachments(pstAtts, messageId);
+  const modTime = msg.getProperty(0x3008)?.value;
   const { iso, timestamp } = parseDateSafe(
-    msg.messageDeliveryTime ?? msg.clientSubmitTime ?? msg.creationTime,
+    msg.messageDeliveryTime ??
+      msg.clientSubmitTime ??
+      msg.creationTime ??
+      (modTime instanceof Date ? modTime : null),
   );
-  const subject = (msg.subject || msg.displayName || '(No Subject)').trim();
+  const subject = decodeMimeWords((msg.subject || msg.displayName || '').trim()) || '(No Subject)';
 
   const mapiProperties: MapiPropertyItem[] = msg
     .getAllProperties()
@@ -812,7 +873,7 @@ export async function loadPstMessageDetail(
     subject,
     senderName,
     senderAddress,
-    toSummary: msg.displayTo || msg.receivedByName || '',
+    toSummary: decodeMimeWords(msg.displayTo || msg.receivedByName || ''),
     date: iso,
     timestamp,
     snippet: buildSnippet(textBody, htmlBody),

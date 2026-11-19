@@ -1,5 +1,7 @@
 import { useVirtualizer } from '@tanstack/react-virtual';
 import {
+  ArrowDownWideNarrow,
+  ArrowUpNarrowWide,
   Calendar,
   Download,
   FileSearch,
@@ -13,7 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import type { MessageSummary, SearchFilter } from '../types/mail';
+import type { MessageSortOrder, MessageSummary, SearchFilter } from '../types/mail';
 import { formatShortDate } from '../utils/formatters';
 
 export interface ListScanProgress {
@@ -29,11 +31,14 @@ interface MessageListProps {
   messages: MessageSummary[];
   selectedMessageId: string | null;
   filter: SearchFilter;
+  sortOrder: MessageSortOrder;
+  sortAnnouncement: string;
   isLoading: boolean;
   scanProgress: ListScanProgress | null;
   isExportingZip: boolean;
   onSelectMessage: (messageId: string) => void;
   onFilterChange: (next: Partial<SearchFilter>) => void;
+  onToggleSortOrder: () => void;
   onCancelScan: () => void;
   onExportFolderZip: () => void;
 }
@@ -43,11 +48,14 @@ export function MessageList({
   messages,
   selectedMessageId,
   filter,
+  sortOrder,
+  sortAnnouncement,
   isLoading,
   scanProgress,
   isExportingZip,
   onSelectMessage,
   onFilterChange,
+  onToggleSortOrder,
   onCancelScan,
   onExportFolderZip,
 }: MessageListProps) {
@@ -145,6 +153,9 @@ export function MessageList({
       aria-label="Message list"
     >
       <div className="space-y-2 border-b p-3" style={{ borderColor: 'var(--pb-border)' }}>
+        <p role="status" className="visually-hidden">
+          {sortAnnouncement}
+        </p>
         <div className="flex items-center justify-between gap-2">
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">
@@ -156,24 +167,54 @@ export function MessageList({
             </p>
           </div>
 
-          <button
-            type="button"
-            disabled={messages.length === 0 || isExportingZip}
-            onClick={onExportFolderZip}
-            className="inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors hover:opacity-80 disabled:opacity-45"
-            style={{
-              borderColor: 'var(--pb-border)',
-              backgroundColor: 'var(--pb-bg-muted)',
-            }}
-            title="Export all messages in the selected folder as .eml files inside a ZIP archive"
-          >
-            {isExportingZip ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <Download className="h-3 w-3" />
-            )}
-            <span>ZIP</span>
-          </button>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                onToggleSortOrder();
+                scrollRef.current?.scrollTo({ top: 0 });
+              }}
+              aria-pressed={sortOrder === 'asc'}
+              className="inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors hover:opacity-80"
+              style={{
+                borderColor: sortOrder === 'asc' ? 'var(--pb-accent)' : 'var(--pb-border)',
+                backgroundColor: sortOrder === 'asc' ? 'var(--pb-bg-selected)' : 'var(--pb-bg-muted)',
+                color: sortOrder === 'asc' ? 'var(--pb-accent)' : 'var(--pb-text-secondary)',
+              }}
+              title="Toggle chronological sort order (undated items always appear at the bottom)"
+            >
+              {sortOrder === 'desc' ? (
+                <>
+                  <ArrowDownWideNarrow className="h-3 w-3" />
+                  <span>Newest first</span>
+                </>
+              ) : (
+                <>
+                  <ArrowUpNarrowWide className="h-3 w-3" />
+                  <span>Oldest first</span>
+                </>
+              )}
+            </button>
+
+            <button
+              type="button"
+              disabled={messages.length === 0 || isExportingZip}
+              onClick={onExportFolderZip}
+              className="inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors hover:opacity-80 disabled:opacity-45"
+              style={{
+                borderColor: 'var(--pb-border)',
+                backgroundColor: 'var(--pb-bg-muted)',
+              }}
+              title="Export all messages in the selected folder as .eml files inside a ZIP archive"
+            >
+              {isExportingZip ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <Download className="h-3 w-3" />
+              )}
+              <span>ZIP</span>
+            </button>
+          </div>
         </div>
 
         {/* Search bar + quick scope toggle */}

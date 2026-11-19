@@ -7,12 +7,14 @@ import type {
   FolderNode,
   LoadedArchiveInfo,
   MessageDetail,
+  MessageSortOrder,
   MessageSummary,
   SearchFilter,
   WorkerProgressEvent,
 } from './types/mail';
 import { triggerBlobDownload } from './utils/formatters';
 import { createSampleMboxFile } from './utils/sampleArchive';
+import { sortMessages } from './utils/sortMessages';
 import {
   applyColorSchemePreference,
   getStoredColorScheme,
@@ -67,6 +69,11 @@ export default function App() {
   const [activeDetail, setActiveDetail] = useState<MessageDetail | null>(null);
 
   const [filter, setFilter] = useState<SearchFilter>(DEFAULT_FILTER);
+  const [sortOrder, setSortOrder] = useState<MessageSortOrder>('desc');
+  const sortOrderRef = useRef<MessageSortOrder>('desc');
+  sortOrderRef.current = sortOrder;
+  const [sortAnnouncement, setSortAnnouncement] = useState('');
+  const userSelectedDuringStreamRef = useRef(false);
 
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [isFolderLoading, setIsFolderLoading] = useState(false);
@@ -177,6 +184,14 @@ export default function App() {
     [revokeAllActiveObjectUrls],
   );
 
+  const handleUserSelectMessage = useCallback(
+    (messageId: string) => {
+      userSelectedDuringStreamRef.current = true;
+      void handleSelectMessage(messageId);
+    },
+    [handleSelectMessage],
+  );
+
   const streamFolder = useCallback(
     (folderId: string) => {
       const client = workerRef.current;
@@ -184,6 +199,8 @@ export default function App() {
 
       cancelActiveStream();
       revokeAllActiveObjectUrls();
+      userSelectedDuringStreamRef.current = false;
+      setSortAnnouncement('');
 
       setSelectedFolderId(folderId);
       setFilter({ ...DEFAULT_FILTER, folderId });
@@ -200,18 +217,43 @@ export default function App() {
       });
 
       let firstBatchHandled = false;
+      let accumulated: MessageSummary[] = [];
+      let batchesSinceSort = 0;
+
       const handle = client.streamFolderMessages(folderId, (update) => {
         if (activeStreamRef.current?.requestId !== handle.requestId) return;
 
         if (update.batch.length > 0) {
-          setMessages((prev) => [...prev, ...update.batch]);
-          if (!firstBatchHandled) {
+          accumulated.push(...update.batch);
+          batchesSinceSort += 1;
+
+          if (accumulated.length <= 15000 || batchesSinceSort >= 4 || update.done) {
+            accumulated = sortMessages(accumulated, sortOrderRef.current);
+            batchesSinceSort = 0;
+            setMessages(accumulated);
+          } else {
+            setMessages([...accumulated]);
+          }
+
+          if (!firstBatchHandled && accumulated.length > 0) {
             firstBatchHandled = true;
-            void handleSelectMessage(update.batch[0].id);
+            void handleSelectMessage(accumulated[0].id);
           }
         }
 
         if (update.done) {
+          if (batchesSinceSort > 0) {
+            accumulated = sortMessages(accumulated, sortOrderRef.current);
+            batchesSinceSort = 0;
+            setMessages(accumulated);
+          }
+          if (
+            !userSelectedDuringStreamRef.current &&
+            accumulated.length > 0 &&
+            accumulated[0].id !== selectedMessageIdRef.current
+          ) {
+            void handleSelectMessage(accumulated[0].id);
+          }
           setIsFolderLoading(false);
           setScanProgress(null);
           activeStreamRef.current = null;
@@ -291,6 +333,7 @@ export default function App() {
 
       cancelActiveStream();
       setMessages([]);
+      setSortAnnouncement('');
       setIsFolderLoading(true);
       setScanProgress({
         mode: 'search',
@@ -300,14 +343,31 @@ export default function App() {
         totalMessages: 0,
       });
 
+      let accumulated: MessageSummary[] = [];
+      let batchesSinceSort = 0;
+
       const handle = client.streamSearchMessages(nextFilter, (update) => {
         if (activeStreamRef.current?.requestId !== handle.requestId) return;
 
         if (update.batch.length > 0) {
-          setMessages((prev) => [...prev, ...update.batch]);
+          accumulated.push(...update.batch);
+          batchesSinceSort += 1;
+
+          if (accumulated.length <= 15000 || batchesSinceSort >= 4 || update.done) {
+            accumulated = sortMessages(accumulated, sortOrderRef.current);
+            batchesSinceSort = 0;
+            setMessages(accumulated);
+          } else {
+            setMessages([...accumulated]);
+          }
         }
 
         if (update.done) {
+          if (batchesSinceSort > 0) {
+            accumulated = sortMessages(accumulated, sortOrderRef.current);
+            batchesSinceSort = 0;
+            setMessages(accumulated);
+          }
           setIsFolderLoading(false);
           setScanProgress(null);
           activeStreamRef.current = null;
@@ -357,6 +417,19 @@ export default function App() {
     [filter, runSearchStream, selectedFolderId],
   );
 
+  const handleToggleSortOrder = useCallback(() => {
+    const nextOrder: MessageSortOrder = sortOrderRef.current === 'desc' ? 'asc' : 'desc';
+    sortOrderRef.current = nextOrder;
+    setSortOrder(nextOrder);
+    setMessages((prev) => {
+      const sorted = sortMessages(prev, nextOrder);
+      setSortAnnouncement(
+        `Sorted by date, ${nextOrder === 'desc' ? 'newest first' : 'oldest first'}, ${sorted.length.toLocaleString()} messages`,
+      );
+      return sorted;
+    });
+  }, []);
+
   const handleExportEml = async (messageId: string) => {
     const client = workerRef.current;
     if (!client) return;
@@ -397,6 +470,7 @@ export default function App() {
     setSelectedMessageId(null);
     setActiveDetail(null);
     setFilter(DEFAULT_FILTER);
+    setSortAnnouncement('');
     setWarnings([]);
     setProgressText(null);
   };
@@ -434,6 +508,8 @@ export default function App() {
           selectedMessageId={selectedMessageId}
           activeDetail={activeDetail}
           filter={filter}
+          sortOrder={sortOrder}
+          sortAnnouncement={sortAnnouncement}
           theme={effectiveTheme}
           isFolderLoading={isFolderLoading}
           scanProgress={scanProgress}
@@ -443,8 +519,9 @@ export default function App() {
           warnings={warnings}
           onDismissWarnings={() => setWarnings([])}
           onSelectFolder={streamFolder}
-          onSelectMessage={handleSelectMessage}
+          onSelectMessage={handleUserSelectMessage}
           onFilterChange={handleFilterChange}
+          onToggleSortOrder={handleToggleSortOrder}
           onCancelScan={cancelActiveStream}
           onExportEml={handleExportEml}
           onExportFolderZip={handleExportFolderZip}

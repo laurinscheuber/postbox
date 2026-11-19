@@ -9,6 +9,7 @@ import {
   type RootProvider,
 } from '@hiraokahypertools/pst-extractor';
 import { inflate } from 'pako';
+import { decodeSmartTextBytes } from '../utils/encoding';
 import type { PagedBlockReader } from './pstBlockReader';
 
 const COMP_ENC: readonly number[] = [
@@ -275,7 +276,7 @@ export class PstEngine {
   private readonly trait: HeaderTrait;
   private readonly pageCache = new Map<string, ParsedBtreePage>();
   private readonly resolver: PropertyValueResolver;
-  private readonly ansiDecoder: TextDecoder;
+  private readonly defaultAnsiEncoding: string;
 
   private nameToIdNumeric = new Map<string, number>();
   private nameToIdString = new Map<string, number>();
@@ -284,15 +285,15 @@ export class PstEngine {
   private constructor(
     reader: PagedBlockReader,
     trait: HeaderTrait,
-    ansiEncoding = 'latin1',
+    ansiEncoding = 'windows-1252',
   ) {
     this.reader = reader;
     this.trait = trait;
-    this.ansiDecoder = new TextDecoder(ansiEncoding, { fatal: false });
+    this.defaultAnsiEncoding = ansiEncoding;
     this.resolver = this.createResolver();
   }
 
-  static async open(reader: PagedBlockReader, ansiEncoding = 'latin1'): Promise<PstEngine> {
+  static async open(reader: PagedBlockReader, ansiEncoding = 'windows-1252'): Promise<PstEngine> {
     const headerBuf = await reader.readExact(0, 1024);
     const headerView = new DataView(headerBuf);
     const trait = parseHeaderTrait(headerView);
@@ -990,6 +991,25 @@ export class PstEngine {
     if (!heap || heap.bClientSig !== 0xbc) return [];
 
     const records = await this.readBthRecords(heap, heap.userRootHnid);
+    let cp3fde: number | undefined;
+    let cp3ffd: number | undefined;
+    let cp66c3: number | undefined;
+    for (const rec of records) {
+      if (rec.key.byteLength < 2 || rec.data.byteLength < 6) continue;
+      const key = new DataView(rec.key).getUint16(0, true);
+      if (key !== 0x3fde && key !== 0x3ffd && key !== 0x66c3) continue;
+      const dv = new DataView(rec.data);
+      if (dv.getUint16(0, true) !== 0x0003) continue;
+      const val = dv.getInt32(2, true);
+      if (val > 0) {
+        if (key === 0x3fde) cp3fde = val;
+        else if (key === 0x3ffd) cp3ffd = val;
+        else cp66c3 = val;
+      }
+    }
+    const codepage = cp3fde ?? cp3ffd ?? cp66c3;
+    const activeResolver = codepage !== undefined ? this.createResolver(codepage) : this.resolver;
+
     const props: Property[] = [];
 
     for (const rec of records) {
@@ -1000,7 +1020,7 @@ export class PstEngine {
       const type = new DataView(rec.data).getUint16(0, true);
       const rawVal = rec.data.slice(2);
       try {
-        const value = await this.resolver.resolveValueOf(key, type, rawVal, heap);
+        const value = await activeResolver.resolveValueOf(key, type, rawVal, heap);
         props.push({ key, type, value });
       } catch {
         // Skip unreadable individual property so corrupt property doesn't abort message
@@ -1064,10 +1084,25 @@ export class PstEngine {
       schemaKeys.add(col.key);
     }
 
-    const activeCols =
+    const filteredCols =
       wantedColumns === null
         ? schema
-        : schema.filter((col) => col.key === 0x67f2 || wantedColumns.has(col.key));
+        : schema.filter(
+            (col) =>
+              col.key === 0x67f2 ||
+              col.key === 0x3fde ||
+              col.key === 0x3ffd ||
+              wantedColumns.has(col.key),
+          );
+    const activeCols = filteredCols.toSorted((a, b) => {
+      const rank = (col: RawTableColumn): number => {
+        if (col.type === 0x0003) return 0;
+        if (col.type === 0x001e || col.type === 0x101e) return 2;
+        return 1;
+      };
+      return rank(a) - rank(b);
+    });
+    const resolverByCodepage = new Map<number, PropertyValueResolver>();
 
     let processed = 0;
     let firstBatchEmitted = false;
@@ -1099,7 +1134,19 @@ export class PstEngine {
 
               const rawVal = rowSlice.slice(col.ibData, col.ibData + col.cbData);
               try {
-                const val = await this.resolver.resolveValueOf(col.key, col.type, rawVal, heap);
+                let colResolver = this.resolver;
+                if (col.type === 0x001e || col.type === 0x101e) {
+                  const cpVal = rowMap.get(0x3fde) ?? rowMap.get(0x3ffd);
+                  if (typeof cpVal === 'number' && cpVal > 0) {
+                    let cached = resolverByCodepage.get(cpVal);
+                    if (!cached) {
+                      cached = this.createResolver(cpVal);
+                      resolverByCodepage.set(cpVal, cached);
+                    }
+                    colResolver = cached;
+                  }
+                }
+                const val = await colResolver.resolveValueOf(col.key, col.type, rawVal, heap);
                 if (val !== undefined) {
                   rowMap.set(col.key, val);
                 }
@@ -1199,19 +1246,28 @@ export class PstEngine {
       propByKey.set(p.key, p);
     }
 
+    const cpVal =
+      propByKey.get(0x3fde)?.value ??
+      propByKey.get(0x3ffd)?.value ??
+      propByKey.get(0x66c3)?.value;
+    const codepageHint = typeof cpVal === 'number' && cpVal > 0 ? cpVal : undefined;
+
     const propertyFinder = {
       findByKey: (key: number) => propByKey.get(key),
       all: () => props,
     };
 
-    const rootProvider = this.createRootProvider();
+    const rootProvider = this.createRootProvider(codepageHint);
     return new PSTMessage(rootProvider, plNode, plSubNode, propertyFinder);
   }
 
-  createRootProvider(): RootProvider {
+  createRootProvider(codepageHint?: number): RootProvider {
     const engine = this;
+    const activeResolver =
+      codepageHint !== undefined ? this.createResolver(codepageHint) : this.resolver;
+    const encodingHint = codepageHint ?? this.defaultAnsiEncoding;
     return {
-      resolver: this.resolver,
+      resolver: activeResolver,
       getNameToIdMapItem(key: number, idx: number): number {
         return engine.nameToIdNumeric.get(`${key}:${idx}`) ?? 0;
       },
@@ -1224,12 +1280,13 @@ export class PstEngine {
       async getFolderOf(): Promise<never> {
         throw new Error('Folder traversal uses streaming engine');
       },
-      convertAnsiStringImmediately: (data: Uint8Array) => this.ansiDecoder.decode(data),
+      convertAnsiStringImmediately: (data: Uint8Array) =>
+        decodeSmartTextBytes(data, encodingHint),
     };
   }
 
-  private createResolver(): PropertyValueResolver {
-    const ansiDecoder = this.ansiDecoder;
+  private createResolver(codepageHint?: number): PropertyValueResolver {
+    const encodingHint: number | string = codepageHint ?? this.defaultAnsiEncoding;
 
     return {
       async resolveValueOf(
@@ -1285,7 +1342,7 @@ export class PstEngine {
             // PT_STRING8
             if (value.byteLength < 4) return '';
             const b = await resolveHeap(view.getUint32(0, true));
-            return ansiDecoder.decode(new Uint8Array(b)).replace(/\0/g, '');
+            return decodeSmartTextBytes(new Uint8Array(b), encodingHint);
           }
           case 0x001f: {
             // PT_UNICODE
@@ -1334,9 +1391,9 @@ export class PstEngine {
             const count = b.byteLength >= 4 ? dv.getUint32(0, true) : 0;
             const out: string[] = [];
             for (let x = 0; x < count - 1; x += 1) {
-              const from = dv.getUint32(4 + 4 * x, true);
-              const to = dv.getUint32(4 + 4 * (x + 1), true);
-              out.push(ansiDecoder.decode(new Uint8Array(b, from, Math.max(0, to - from))).replace(/\0/g, ''));
+              const from = Math.min(dv.getUint32(4 + 4 * x, true), b.byteLength);
+              const to = Math.max(from, Math.min(dv.getUint32(4 + 4 * (x + 1), true), b.byteLength));
+              out.push(decodeSmartTextBytes(new Uint8Array(b, from, to - from), encodingHint));
             }
             return out;
           }

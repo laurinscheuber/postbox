@@ -78,6 +78,8 @@ export interface MessageDetail extends MessageSummary {
 
 export type SearchScope = 'folder' | 'archive';
 
+export type MessageSortOrder = 'desc' | 'asc';
+
 export interface SearchFilter {
   folderId: string;
   scope: SearchScope;

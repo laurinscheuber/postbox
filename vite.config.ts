@@ -33,7 +33,7 @@ export default defineConfig({
     format: 'es',
   },
   build: {
-    target: 'es2022',
+    target: 'es2023',
     sourcemap: false,
   },
   test: {
