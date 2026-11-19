@@ -499,7 +499,12 @@ async function handleLoadFiles(requestId: string, files: File[]): Promise<void> 
     archiveSeq += 1;
     const archiveId = `arch-${archiveSeq}`;
 
-    emitProgress(requestId, `Opening ${file.name}…`, i, files.length);
+    emitProgress(
+      requestId,
+      `Opening ${file.name}…`,
+      files.length > 1 ? i : 0,
+      files.length > 1 ? files.length : 0,
+    );
 
     try {
       if (ext === 'pst' || ext === 'ost') {
@@ -507,6 +512,7 @@ async function handleLoadFiles(requestId: string, files: File[]): Promise<void> 
           file,
           archiveId,
           ext,
+          (label) => emitProgress(requestId, label, 0, 0),
         );
         pstSessions.set(archiveId, session);
         registerPstFolders(session);

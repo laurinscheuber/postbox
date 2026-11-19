@@ -15,7 +15,6 @@ import {
   NID_ROOT_FOLDER,
   NID_TYPE_CONTENTS_TABLE,
   NID_TYPE_HIERARCHY_TABLE,
-  NID_TYPE_NORMAL_FOLDER,
   NID_TYPE_NORMAL_MESSAGE,
   PstEngine,
   makeSiblingNid,
@@ -217,6 +216,7 @@ export async function openPstArchive(
   file: File,
   archiveId: string,
   format: 'pst' | 'ost',
+  onProgress?: (label: string) => void,
 ): Promise<{ session: PstArchiveSession; defaultFolderId: string | null }> {
   const reader = createPstBlockReader(file);
   const engine = await PstEngine.open(reader, 'latin1');
@@ -225,7 +225,10 @@ export async function openPstArchive(
   const allFolderIds: string[] = [];
   const visitedNids = new Set<number>();
 
-  async function getChildFolderNids(folderNid: number): Promise<number[]> {
+  async function getChildFolderNids(
+    folderNid: number,
+    isRootWrapper: boolean,
+  ): Promise<number[]> {
     const hierNid = makeSiblingNid(folderNid, NID_TYPE_HIERARCHY_TABLE);
     const hierEntry = await engine.lookupNode(hierNid);
     if (hierEntry) {
@@ -249,14 +252,20 @@ export async function openPstArchive(
           }
         },
       );
-      if (childNids.length > 0) {
+      if (!isRootWrapper || childNids.length > 0) {
         return childNids;
       }
     }
 
-    // Fallback when hierarchy table is missing (e.g., certain OST structures or root wrappers)
-    const scanned = await engine.scanChildNidsByParent(folderNid, NID_TYPE_NORMAL_FOLDER);
-    return scanned.map((s) => s.nid);
+    if (isRootWrapper) {
+      const ipmSubTreeNid = await engine.readIpmSubTreeNid();
+      if (ipmSubTreeNid !== null && ipmSubTreeNid !== folderNid) {
+        return [ipmSubTreeNid];
+      }
+    }
+
+    // One-time cached folder-only NBT fallback (never scans per leaf folder)
+    return await engine.getFallbackChildFolderNids(folderNid);
   }
 
   async function walkFolder(
@@ -266,6 +275,9 @@ export async function openPstArchive(
   ): Promise<FolderNode | null> {
     if (visitedNids.has(folderNid)) return null;
     visitedNids.add(folderNid);
+    if (visitedNids.size === 1 || visitedNids.size % 10 === 0) {
+      onProgress?.(`Scanning folder tree (${visitedNids.size} folders)…`);
+    }
 
     const entry = await engine.lookupNode(folderNid);
     if (!entry) return null;
@@ -282,7 +294,11 @@ export async function openPstArchive(
     const rawName = getStr(propMap, 0x3001);
     const totalCount = Math.max(0, getNum(propMap, 0x3602));
     const unreadCount = Math.max(0, getNum(propMap, 0x3603));
-    const childNids = await getChildFolderNids(folderNid);
+    const hasSubfoldersProp = propMap.has(0x360a) ? getBool(propMap, 0x360a) : true;
+    const childNids =
+      !isRootWrapper && !hasSubfoldersProp
+        ? []
+        : await getChildFolderNids(folderNid, isRootWrapper);
 
     // Unwrap nameless PST root wrapper
     if (isRootWrapper && !rawName && totalCount === 0 && childNids.length > 0) {
@@ -447,51 +463,81 @@ export async function streamPstFolderHeaders(
       `contents(${meta.folderNid})`,
     );
 
-    const { total, schemaKeys } = await session.engine.streamTableRows(
+    const streamResult = await session.engine.streamTableRows(
       contentsSub,
       HEADER_KEYS,
       batchSize,
-      async (rows, processed, totalRows) => {
-        const hasSubjectCol = schemaKeys.has(0x0037) || schemaKeys.has(0x0e1d);
-        const hasSenderCol =
-          schemaKeys.has(0x0c1a) || schemaKeys.has(0x0042) || schemaKeys.has(0x5d01);
-        const needsPerMsgFallback = !hasSubjectCol || !hasSenderCol;
+      async (rows, processed, totalRows, tableSchemaKeys) => {
+        const hasSubjectCol =
+          tableSchemaKeys.has(0x0037) ||
+          tableSchemaKeys.has(0x0e1d) ||
+          tableSchemaKeys.has(0x0070) ||
+          tableSchemaKeys.has(0x3001);
+        const hasSenderOrToCol =
+          tableSchemaKeys.has(0x0c1a) ||
+          tableSchemaKeys.has(0x0042) ||
+          tableSchemaKeys.has(0x5d01) ||
+          tableSchemaKeys.has(0x0c1f) ||
+          tableSchemaKeys.has(0x0e04);
 
-        const batch: MessageSummary[] = [];
+        const rowEntries: Array<{ rowNid: number; rowMap: Map<number, unknown>; needsFallback: boolean }> = [];
         for (let idx = 0; idx < rows.length; idx += 1) {
-          if (options.isCancelled?.()) return;
           const rowMap = rows[idx];
           const rowNid = rowMap.get(0x67f2);
           if (typeof rowNid !== 'number' || rowNid === 0) continue;
 
-          let finalProps = rowMap;
-          if (needsPerMsgFallback) {
-            const msgEntry = await session.engine.lookupNode(rowNid);
-            if (msgEntry) {
-              const msgSub = session.engine.createSubNodeHandle(
-                msgEntry.nid,
-                msgEntry.bidData,
-                msgEntry.bidSub,
-                `hdr(${rowNid})`,
-              );
-              const extra = await session.engine.readProperties(msgSub, HEADER_KEYS);
-              finalProps = new Map(rowMap);
-              for (const p of extra) {
-                if (!finalProps.has(p.key)) finalProps.set(p.key, p.value);
-              }
-            }
-          }
+          const missingSubject =
+            !hasSubjectCol ||
+            (!rowMap.get(0x0037) && !rowMap.get(0x0e1d) && !rowMap.get(0x0070) && !rowMap.get(0x3001));
+          const missingSenderAndTo =
+            !hasSenderOrToCol ||
+            (!rowMap.get(0x0c1a) &&
+              !rowMap.get(0x0042) &&
+              !rowMap.get(0x5d01) &&
+              !rowMap.get(0x0c1f) &&
+              !rowMap.get(0x0e04));
 
-          batch.push(
-            buildSummaryFromProps(finalProps, {
-              archiveId: session.archiveId,
-              folderId,
-              folderPath,
-              folderNid: meta.folderNid,
-              msgNid: rowNid,
-              format: session.format,
+          rowEntries.push({
+            rowNid,
+            rowMap,
+            needsFallback: missingSubject || missingSenderAndTo,
+          });
+        }
+
+        const batch: MessageSummary[] = [];
+        for (let offset = 0; offset < rowEntries.length; offset += 20) {
+          if (options.isCancelled?.()) return;
+          const chunk = rowEntries.slice(offset, offset + 20);
+          const resolvedChunk = await Promise.all(
+            chunk.map(async ({ rowNid, rowMap, needsFallback }) => {
+              let finalProps = rowMap;
+              if (needsFallback) {
+                const msgEntry = await session.engine.lookupNode(rowNid);
+                if (msgEntry) {
+                  const msgSub = session.engine.createSubNodeHandle(
+                    msgEntry.nid,
+                    msgEntry.bidData,
+                    msgEntry.bidSub,
+                    `hdr(${rowNid})`,
+                  );
+                  const extra = await session.engine.readProperties(msgSub, HEADER_KEYS);
+                  finalProps = new Map(rowMap);
+                  for (const p of extra) {
+                    if (!finalProps.has(p.key)) finalProps.set(p.key, p.value);
+                  }
+                }
+              }
+              return buildSummaryFromProps(finalProps, {
+                archiveId: session.archiveId,
+                folderId,
+                folderPath,
+                folderNid: meta.folderNid,
+                msgNid: rowNid,
+                format: session.format,
+              });
             }),
           );
+          batch.push(...resolvedChunk);
         }
 
         if (canCache) {
@@ -504,13 +550,14 @@ export async function streamPstFolderHeaders(
         }
 
         if (batch.length > 0) {
-          await options.onBatch(batch, processed, totalRows);
+          await options.onBatch(batch, processed, totalRows || meta.node.totalCount);
         }
         await yieldToEventLoop();
       },
       options.isCancelled,
     );
 
+    const total = streamResult.total;
     if (options.isCancelled?.()) {
       return { total, cancelled: true };
     }

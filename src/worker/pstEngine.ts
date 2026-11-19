@@ -8,6 +8,7 @@ import {
   type PropertyValueResolver,
   type RootProvider,
 } from '@hiraokahypertools/pst-extractor';
+import { inflate } from 'pako';
 import type { PagedBlockReader } from './pstBlockReader';
 
 const COMP_ENC: readonly number[] = [
@@ -52,8 +53,10 @@ export const NID_TYPE_SEARCH_FOLDER = 0x03;
 export const NID_TYPE_NORMAL_MESSAGE = 0x04;
 export const NID_TYPE_HIERARCHY_TABLE = 0x0d;
 export const NID_TYPE_CONTENTS_TABLE = 0x0e;
+export const NID_MESSAGE_STORE = 33;
 export const NID_NAME_TO_ID_MAP = 97;
 export const NID_ROOT_FOLDER = 290;
+export const NID_TOP_OF_OUTLOOK_DATA_FILE = 32802;
 
 const MAX_BTREE_PAGE_CACHE = 1024;
 const utf16Decoder = new TextDecoder('utf-16le');
@@ -111,27 +114,12 @@ function decodeCompressible(buf: ArrayBuffer): void {
   }
 }
 
-async function inflateZlib(buf: ArrayBuffer): Promise<ArrayBuffer> {
-  const ds = new DecompressionStream('deflate');
-  const writer = ds.writable.getWriter();
-  const writeDone = writer.write(new Uint8Array(buf)).then(() => writer.close());
-  const reader = ds.readable.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    total += value.byteLength;
+function inflateZlib(buf: ArrayBuffer): ArrayBuffer {
+  const out = inflate(new Uint8Array(buf));
+  if (out.byteOffset === 0 && out.byteLength === out.buffer.byteLength) {
+    return out.buffer as ArrayBuffer;
   }
-  await writeDone;
-  const out = new Uint8Array(total);
-  let pos = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, pos);
-    pos += chunk.byteLength;
-  }
-  return out.buffer;
+  return out.slice().buffer;
 }
 
 function concatArrayBuffers(buffers: ArrayBuffer[]): ArrayBuffer {
@@ -267,6 +255,11 @@ export interface HeapReader {
   readonly bClientSig: number;
   readonly userRootHnid: number;
   getHeapBuffers(hnid: number): Promise<ArrayBuffer[]>;
+  streamHeapBuffers(
+    hnid: number,
+    onBuffer: (buf: ArrayBuffer) => Promise<void> | void,
+    isCancelled?: () => boolean,
+  ): Promise<void>;
 }
 
 export interface RawTableColumn {
@@ -286,6 +279,7 @@ export class PstEngine {
 
   private nameToIdNumeric = new Map<string, number>();
   private nameToIdString = new Map<string, number>();
+  private folderChildrenMap: Map<number, number[]> | null = null;
 
   private constructor(
     reader: PagedBlockReader,
@@ -321,11 +315,13 @@ export class PstEngine {
 
   clearCaches(): void {
     this.pageCache.clear();
+    this.folderChildrenMap = null;
     this.reader.clearCache();
   }
 
   async close(): Promise<void> {
     this.pageCache.clear();
+    this.folderChildrenMap = null;
     await this.reader.close();
   }
 
@@ -338,8 +334,12 @@ export class PstEngine {
       return cached;
     }
 
-    const buf = await this.reader.readExact(ib, this.trait.pageSize);
-    const view = new DataView(buf);
+    let buf = await this.reader.readExact(ib, this.trait.pageSize);
+    let view = new DataView(buf);
+    if (this.trait.is4K && buf.byteLength >= 4 && view.getUint16(0, true) === 0x9c78) {
+      buf = inflateZlib(buf);
+      view = new DataView(buf);
+    }
     const cEnt = this.trait.is4K
       ? view.getUint16(this.trait.cEntOffset, true)
       : view.getUint8(this.trait.cEntOffset);
@@ -417,8 +417,9 @@ export class PstEngine {
       if (this.trait.is64Bit) {
         for (let i = 0; i < cEnt; i += 1) {
           const top = 24 * i;
+          const rawKey = readU64(view, top);
           entries.push({
-            btkey: readU64(view, top),
+            btkey: isNbt ? (rawKey & 0xffffffffn) : normalizeBid(rawKey),
             bid: readU64(view, top + 8),
             ib: toSafeNumber(readU64(view, top + 16), 'BTENTRY.ib'),
           });
@@ -426,8 +427,9 @@ export class PstEngine {
       } else {
         for (let i = 0; i < cEnt; i += 1) {
           const top = 12 * i;
+          const rawKey = BigInt(view.getUint32(top, true));
           entries.push({
-            btkey: BigInt(view.getUint32(top, true)),
+            btkey: isNbt ? rawKey : normalizeBid(rawKey),
             bid: BigInt(view.getUint32(top + 4, true)),
             ib: view.getUint32(top + 8, true),
           });
@@ -578,6 +580,70 @@ export class PstEngine {
     return results;
   }
 
+  /**
+   * Resolves the root IPM subtree folder NID from the Message Store (`NID = 33`)
+   * property `PidTagIpmSubTreeEntryId` (`0x35e0`) or standard `32802` node.
+   */
+  async readIpmSubTreeNid(): Promise<number | null> {
+    const storeEntry = await this.lookupNode(NID_MESSAGE_STORE);
+    if (storeEntry) {
+      const storeSub = this.createSubNodeHandle(
+        storeEntry.nid,
+        storeEntry.bidData,
+        storeEntry.bidSub,
+        'MessageStore',
+      );
+      const props = await this.readProperties(storeSub, new Set([0x35e0]));
+      const entryId = props.find((p) => p.key === 0x35e0)?.value;
+      if (entryId instanceof ArrayBuffer && entryId.byteLength >= 24) {
+        const candidateNid = new DataView(entryId).getUint32(entryId.byteLength - 4, true);
+        if (candidateNid !== 0 && (await this.lookupNode(candidateNid))) {
+          return candidateNid;
+        }
+      }
+    }
+    if (await this.lookupNode(NID_TOP_OF_OUTLOOK_DATA_FILE)) {
+      return NID_TOP_OF_OUTLOOK_DATA_FILE;
+    }
+    return null;
+  }
+
+  /**
+   * One-time cached folder-only NBT scan fallback for archives missing Hierarchy Tables.
+   * Retains ONLY folder NIDs (`0x02`/`0x03`) keyed by `nidParent` so message NIDs never accumulate in RAM.
+   */
+  async getFallbackChildFolderNids(parentNid: number): Promise<number[]> {
+    if (!this.folderChildrenMap) {
+      const map = new Map<number, number[]>();
+      const walkNbtFolders = async (ib: number): Promise<void> => {
+        if (ib === 0) return;
+        const page = await this.readBtreePage(ib, true);
+        if (page.kind === 'nbt-leaf') {
+          for (const entry of page.entries) {
+            const nidType = getNidType(entry.nid);
+            if (nidType === NID_TYPE_NORMAL_FOLDER || nidType === NID_TYPE_SEARCH_FOLDER) {
+              if (entry.nid === entry.nidParent) continue;
+              const bucket = map.get(entry.nidParent);
+              if (bucket) {
+                bucket.push(entry.nid);
+              } else {
+                map.set(entry.nidParent, [entry.nid]);
+              }
+            }
+          }
+        } else if (page.kind === 'bt-internal') {
+          for (let i = 0; i < page.entries.length; i += 8) {
+            const chunk = page.entries.slice(i, i + 8);
+            await Promise.all(chunk.map((child) => walkNbtFolders(child.ib)));
+          }
+        }
+      };
+      await walkNbtFolders(this.trait.nbtRootIb);
+      this.folderChildrenMap = map;
+    }
+    return this.folderChildrenMap.get(parentNid) ?? [];
+  }
+
   private async readBlockPayload(entry: BbtLeafEntry, decrypt: boolean): Promise<ArrayBuffer> {
     if (entry.cb === 0) return new ArrayBuffer(0);
     const buf = await this.reader.readExact(entry.ib, entry.cb);
@@ -587,17 +653,21 @@ export class PstEngine {
     if (this.trait.is4K && buf.byteLength >= 4) {
       const view = new DataView(buf);
       if (view.getUint16(0, true) === 0x9c78) {
-        return await inflateZlib(buf);
+        return inflateZlib(buf);
       }
     }
     return buf;
   }
 
-  async readDataBuffers(bid: bigint): Promise<ArrayBuffer[]> {
-    const out: ArrayBuffer[] = [];
+  async streamDataBuffers(
+    bid: bigint,
+    onBuffer: (buf: ArrayBuffer) => Promise<void> | void,
+    isCancelled?: () => boolean,
+  ): Promise<void> {
     const visited = new Set<bigint>();
 
-    const collect = async (targetBid: bigint): Promise<void> => {
+    const walk = async (targetBid: bigint): Promise<void> => {
+      if (isCancelled?.()) return;
       const norm = normalizeBid(targetBid);
       if (norm === 0n || visited.has(norm)) return;
       visited.add(norm);
@@ -606,7 +676,7 @@ export class PstEngine {
       if (!entry) return;
 
       if (entry.isData) {
-        out.push(await this.readBlockPayload(entry, true));
+        await onBuffer(await this.readBlockPayload(entry, true));
         return;
       }
 
@@ -620,16 +690,24 @@ export class PstEngine {
 
       const stride = this.trait.is64Bit ? 8 : 4;
       for (let i = 0; i < itemCount; i += 1) {
+        if (isCancelled?.()) return;
         const pos = 8 + stride * i;
         if (pos + stride > buf.byteLength) break;
         const childBid = this.trait.is64Bit
           ? readU64(view, pos)
           : BigInt(view.getUint32(pos, true));
-        await collect(childBid);
+        await walk(childBid);
       }
     };
 
-    await collect(bid);
+    await walk(bid);
+  }
+
+  async readDataBuffers(bid: bigint): Promise<ArrayBuffer[]> {
+    const out: ArrayBuffer[] = [];
+    await this.streamDataBuffers(bid, (buf) => {
+      out.push(buf);
+    });
     return out;
   }
 
@@ -653,13 +731,10 @@ export class PstEngine {
     const headerBytes = this.trait.is64Bit ? 8 : 4;
 
     if (level === 0) {
-      // SLBLOCK
+      // SLBLOCK (small per-node subnode block, linear scan safe even if unsorted)
       const stride = this.trait.is64Bit ? 24 : 12;
-      let lo = 0;
-      let hi = count - 1;
-      while (lo <= hi) {
-        const mid = (lo + hi) >>> 1;
-        const pos = headerBytes + stride * mid;
+      for (let i = 0; i < count; i += 1) {
+        const pos = headerBytes + stride * i;
         if (pos + stride > buf.byteLength) break;
         const nid = BigInt(view.getUint32(pos, true));
         if (nid === targetKey) {
@@ -670,8 +745,6 @@ export class PstEngine {
                 bidSub: BigInt(view.getUint32(pos + 8, true)),
               };
         }
-        if (nid < targetKey) lo = mid + 1;
-        else hi = mid - 1;
       }
       return undefined;
     }
@@ -705,7 +778,12 @@ export class PstEngine {
     bidData: bigint,
     bidSub: bigint,
     label?: string,
-  ): PLSubNode {
+  ): PLSubNode & {
+    streamData?: (
+      onBuffer: (buf: ArrayBuffer) => Promise<void> | void,
+      isCancelled?: () => boolean,
+    ) => Promise<void>;
+  } {
     const selfEngine = this;
     const is4K = this.trait.is4K;
     return {
@@ -724,10 +802,21 @@ export class PstEngine {
       async getData(): Promise<ArrayBuffer[]> {
         return await selfEngine.readDataBuffers(bidData);
       },
+      async streamData(
+        onBuffer: (buf: ArrayBuffer) => Promise<void> | void,
+        isCancelled?: () => boolean,
+      ): Promise<void> {
+        await selfEngine.streamDataBuffers(bidData, onBuffer, isCancelled);
+      },
       toString(): string {
         return label ?? `subNode(${nodeId})`;
       },
-    } as PLSubNode;
+    } as PLSubNode & {
+      streamData?: (
+        onBuffer: (buf: ArrayBuffer) => Promise<void> | void,
+        isCancelled?: () => boolean,
+      ) => Promise<void>;
+    };
   }
 
   createPLNode(entry: NbtLeafEntry): PLNode {
@@ -805,6 +894,37 @@ export class PstEngine {
         }
         const chunk = chunks.get(hnid);
         return chunk ? [chunk] : [];
+      },
+      async streamHeapBuffers(
+        hnid: number,
+        onBuffer: (buf: ArrayBuffer) => Promise<void> | void,
+        isCancelled?: () => boolean,
+      ): Promise<void> {
+        if (hnid === 0) return;
+        if ((hnid & 0x1f) !== 0) {
+          const child = (await subNode.getChildBy(hnid)) as
+            | (PLSubNode & {
+                streamData?: (
+                  cb: (buf: ArrayBuffer) => Promise<void> | void,
+                  cancelled?: () => boolean,
+                ) => Promise<void>;
+              })
+            | undefined;
+          if (!child) return;
+          if (child.streamData) {
+            await child.streamData(onBuffer, isCancelled);
+          } else {
+            for (const buf of await child.getData()) {
+              if (isCancelled?.()) return;
+              await onBuffer(buf);
+            }
+          }
+          return;
+        }
+        const chunk = chunks.get(hnid);
+        if (chunk && !isCancelled?.()) {
+          await onBuffer(chunk);
+        }
       },
     };
   }
@@ -891,14 +1011,20 @@ export class PstEngine {
   }
 
   /**
-   * Streams Table Context (`bTypeTC = 0x7C`) rows in fixed batches, resolving only
-   * `wantedColumns` (plus `0x67f2` `ltpRowId` when present).
+   * Streams Table Context (`bTypeTC = 0x7C`) rows block-by-block in batches, resolving only
+   * `wantedColumns` (plus `0x67f2` `ltpRowId` when present) and passing `schemaKeys` directly
+   * into `onBatch` to avoid outer-scope TDZ bugs.
    */
   async streamTableRows(
     subNode: PLSubNode,
     wantedColumns: Set<number> | null,
     batchSize: number,
-    onBatch: (rows: Map<number, unknown>[], processed: number, total: number) => Promise<void> | void,
+    onBatch: (
+      rows: Map<number, unknown>[],
+      processed: number,
+      total: number,
+      schemaKeys: ReadonlySet<number>,
+    ) => Promise<void> | void,
     isCancelled?: () => boolean,
   ): Promise<{ total: number; schemaKeys: Set<number> }> {
     const heap = await this.openHeap(subNode);
@@ -943,63 +1069,66 @@ export class PstEngine {
         ? schema
         : schema.filter((col) => col.key === 0x67f2 || wantedColumns.has(col.key));
 
-    const rowPages = hnidRows !== 0 ? await heap.getHeapBuffers(hnidRows) : [];
-    const pageRowCounts = rowPages.map((p) => Math.floor(p.byteLength / numRowBytes));
-    const total = pageRowCounts.reduce((acc, n) => acc + n, 0);
-
     let processed = 0;
+    let firstBatchEmitted = false;
     let currentBatch: Map<number, unknown>[] = [];
+    const firstLimit = Math.min(100, batchSize);
 
-    for (let pIdx = 0; pIdx < rowPages.length; pIdx += 1) {
-      const page = rowPages[pIdx];
-      const rowsInPage = pageRowCounts[pIdx];
+    if (hnidRows !== 0) {
+      await heap.streamHeapBuffers(
+        hnidRows,
+        async (page) => {
+          const rowsInPage = Math.floor(page.byteLength / numRowBytes);
+          for (let rIdx = 0; rIdx < rowsInPage; rIdx += 1) {
+            if (isCancelled?.()) return;
 
-      for (let rIdx = 0; rIdx < rowsInPage; rIdx += 1) {
-        if (isCancelled?.()) {
-          return { total, schemaKeys };
-        }
+            const rowStart = rIdx * numRowBytes;
+            const rowEnd = rowStart + numRowBytes;
+            if (rowEnd > page.byteLength) break;
 
-        const rowStart = rIdx * numRowBytes;
-        const rowEnd = rowStart + numRowBytes;
-        if (rowEnd > page.byteLength) break;
+            const rowSlice = page.slice(rowStart, rowEnd);
+            const rgCEB = new Uint8Array(rowSlice, cebOffset);
+            const rowMap = new Map<number, unknown>();
 
-        const rowSlice = page.slice(rowStart, rowEnd);
-        const rgCEB = new Uint8Array(rowSlice, cebOffset);
-        const rowMap = new Map<number, unknown>();
+            for (const col of activeCols) {
+              const bytePos = Math.floor(col.iBit / 8);
+              const bitMask = 1 << (7 - (col.iBit % 8));
+              const exists = bytePos < rgCEB.byteLength && (rgCEB[bytePos] & bitMask) !== 0;
+              if (!exists) continue;
+              if (col.ibData + col.cbData > rowSlice.byteLength) continue;
 
-        for (const col of activeCols) {
-          const bytePos = Math.floor(col.iBit / 8);
-          const bitMask = 1 << (7 - (col.iBit % 8));
-          const exists = bytePos < rgCEB.byteLength && (rgCEB[bytePos] & bitMask) !== 0;
-          if (!exists) continue;
-          if (col.ibData + col.cbData > rowSlice.byteLength) continue;
-
-          const rawVal = rowSlice.slice(col.ibData, col.ibData + col.cbData);
-          try {
-            const val = await this.resolver.resolveValueOf(col.key, col.type, rawVal, heap);
-            if (val !== undefined) {
-              rowMap.set(col.key, val);
+              const rawVal = rowSlice.slice(col.ibData, col.ibData + col.cbData);
+              try {
+                const val = await this.resolver.resolveValueOf(col.key, col.type, rawVal, heap);
+                if (val !== undefined) {
+                  rowMap.set(col.key, val);
+                }
+              } catch {
+                // Skip unreadable column value
+              }
             }
-          } catch {
-            // Skip unreadable column value
+
+            currentBatch.push(rowMap);
+            processed += 1;
+
+            const targetSize = firstBatchEmitted ? batchSize : firstLimit;
+            if (currentBatch.length >= targetSize) {
+              firstBatchEmitted = true;
+              const flush = currentBatch;
+              currentBatch = [];
+              await onBatch(flush, processed, 0, schemaKeys);
+            }
           }
-        }
-
-        currentBatch.push(rowMap);
-        processed += 1;
-
-        if (currentBatch.length >= batchSize) {
-          await onBatch(currentBatch, processed, total);
-          currentBatch = [];
-        }
-      }
+        },
+        isCancelled,
+      );
     }
 
     if (currentBatch.length > 0 && !isCancelled?.()) {
-      await onBatch(currentBatch, processed, total);
+      await onBatch(currentBatch, processed, processed, schemaKeys);
     }
 
-    return { total, schemaKeys };
+    return { total: processed, schemaKeys };
   }
 
   private async loadNameToIdMap(): Promise<void> {
