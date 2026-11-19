@@ -13,7 +13,7 @@ function toBase64Utf8(str: string): string {
  * and downloadable attachments so users can try Postbox without uploading files.
  */
 export function createSampleMboxFile(): File {
-  const inlineLogoSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="32" viewBox="0 0 120 32"><rect width="120" height="32" rx="6" fill="#0f172a"/><text x="16" y="21" fill="#38bdf8" font-family="sans-serif" font-size="14" font-weight="700">POSTBOX</text></svg>`;
+  const inlineLogoSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="144" height="36" viewBox="0 0 144 36" fill="none"><rect width="144" height="36" rx="9" fill="#0B1325"/><rect x="6" y="6" width="24" height="24" rx="6" fill="#38BDF8"/><path d="M9.5 13.5L18 19.5L26.5 13.5" stroke="#0B1325" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><rect x="13" y="23" width="10" height="2.2" rx="1.1" fill="#0B1325" fill-opacity="0.72"/><text x="38" y="23" fill="#F8FAFC" font-family="system-ui, -apple-system, sans-serif" font-size="14" font-weight="700" letter-spacing="0.04em">POSTBOX</text></svg>`;
   const inlineLogoB64 = toBase64Utf8(inlineLogoSvg);
   const auditNotesB64 = toBase64Utf8(
     'Postbox Security Architecture Verification\n=======================================\n1. Zero-Upload: All parsing runs in local browser Web Workers.\n2. CSP Policy: connect-src none prevents any network egress.\n3. Tracking Pixel Strip: External http/https images are blocked by default.\n',

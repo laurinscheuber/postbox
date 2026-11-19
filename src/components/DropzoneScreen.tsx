@@ -1,5 +1,6 @@
 import { FileArchive, HardDrive, Lock, ShieldAlert, Sparkles, Upload } from 'lucide-react';
 import { useState, type DragEvent } from 'react';
+import { PostboxLogo } from './PostboxLogo';
 
 interface DropzoneScreenProps {
   onFilesSelected: (files: File[]) => void;
@@ -40,6 +41,7 @@ export function DropzoneScreen({
     <main className="flex flex-1 flex-col items-center justify-center overflow-y-auto px-4 py-10">
       <div className="w-full max-w-2xl space-y-6">
         <div className="text-center">
+          <PostboxLogo className="mx-auto mb-3 h-12 w-12 drop-shadow-sm" />
           <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
             Inspect mail archives without uploading a single byte
           </h1>

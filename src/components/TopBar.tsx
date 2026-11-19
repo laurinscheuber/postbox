@@ -12,6 +12,7 @@ import { useEffect, useState } from 'react';
 import type { LoadedArchiveInfo } from '../types/mail';
 import { formatBytes } from '../utils/formatters';
 import type { ColorSchemePreference } from '../utils/theme';
+import { PostboxLogo } from './PostboxLogo';
 
 interface TopBarProps {
   archives: LoadedArchiveInfo[];
@@ -59,38 +60,7 @@ export function TopBar({
       >
         <div className="flex min-w-0 items-center gap-3">
           <div className="flex items-center gap-2.5">
-            <svg
-              className="h-7 w-7 shrink-0"
-              viewBox="0 0 32 32"
-              fill="none"
-              aria-hidden="true"
-            >
-              <rect width="32" height="32" rx="8" fill="#0F172A" />
-              <rect
-                x="4"
-                y="6"
-                width="24"
-                height="20"
-                rx="4"
-                fill="#1E293B"
-                stroke="#38BDF8"
-                strokeWidth="1.5"
-              />
-              <path
-                d="M6.5 9.5L16 16.5L25.5 9.5"
-                stroke="#38BDF8"
-                strokeWidth="1.75"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-              <path
-                d="M6.5 21H25.5"
-                stroke="#94A3B8"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-              />
-              <circle cx="24" cy="21" r="3.5" fill="#10B981" stroke="#0F172A" strokeWidth="1.25" />
-            </svg>
+            <PostboxLogo className="h-7 w-7 shrink-0" />
             <div className="flex items-baseline gap-2">
               <span className="text-sm font-semibold tracking-tight">Postbox</span>
               <span
