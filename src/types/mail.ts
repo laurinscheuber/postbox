@@ -31,6 +31,7 @@ export interface EmailAddress {
 export interface MessageSummary {
   id: string;
   folderId: string;
+  folderPath: string;
   archiveId: string;
   format: ArchiveFormat;
   subject: string;
@@ -75,8 +76,12 @@ export interface MessageDetail extends MessageSummary {
   attachments: AttachmentItem[];
 }
 
+export type SearchScope = 'folder' | 'archive';
+
 export interface SearchFilter {
   folderId: string;
+  scope: SearchScope;
+  searchBodies: boolean;
   query: string;
   dateFrom: string;
   dateTo: string;
@@ -98,6 +103,7 @@ export type WorkerRequest =
   | { type: 'GET_MESSAGE_DETAIL'; requestId: string; messageId: string }
   | { type: 'EXPORT_EML'; requestId: string; messageId: string }
   | { type: 'EXPORT_FOLDER_ZIP'; requestId: string; folderId: string }
+  | { type: 'CANCEL_TASK'; requestId: string; targetRequestId: string }
   | { type: 'CLEAR_SESSION'; requestId: string };
 
 export type WorkerProgressEvent = {
@@ -119,16 +125,25 @@ export type WorkerResponse =
       warnings: string[];
     }
   | {
-      type: 'FOLDER_MESSAGES';
+      type: 'FOLDER_MESSAGES_BATCH';
       requestId: string;
       folderId: string;
-      messages: MessageSummary[];
+      batch: MessageSummary[];
+      loadedCount: number;
+      totalCount: number;
+      done: boolean;
+      cancelled?: boolean;
     }
   | {
-      type: 'SEARCH_RESULTS';
+      type: 'SEARCH_RESULTS_BATCH';
       requestId: string;
-      folderId: string;
-      messages: MessageSummary[];
+      batch: MessageSummary[];
+      scannedFolders: number;
+      totalFolders: number;
+      scannedMessages: number;
+      totalMessages: number;
+      done: boolean;
+      cancelled?: boolean;
     }
   | {
       type: 'MESSAGE_DETAIL';
@@ -146,6 +161,10 @@ export type WorkerResponse =
       requestId: string;
       filename: string;
       bytes: Uint8Array;
+    }
+  | {
+      type: 'TASK_CANCELLED';
+      requestId: string;
     }
   | {
       type: 'SESSION_CLEARED';

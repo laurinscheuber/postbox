@@ -5,8 +5,8 @@
 ## Features
 
 - **Strict Zero-Upload Architecture:** All parsing, indexing, HTML sanitization, and ZIP/EML generation run locally inside a browser Web Worker. Nothing leaves your machine.
-- **Broad Format Support:**
-  - `.pst` & `.ost` (Outlook Personal & Offline Data Files) via `@hiraokahypertools/pst-extractor` with a custom `File.slice()` random-access reader and 256 KB LRU block cache (32 MB cap).
+- **Broad Format Support (40 GB+ Ready):**
+  - `.pst` & `.ost` (Outlook Personal & Offline Data Files) via a 64-bit `BigInt` lazy B-tree engine backed by 64 KB `File.slice()` blocks and a bounded 2,048-block (~128 MB) LRU cache—capable of opening 40 GB+ archives with flat RAM usage.
   - `.msg` (Outlook Message items) via `@kenjiuno/msgreader` with full MAPI raw property extraction.
   - `.eml` & `.mbox` (RFC 5322 & Unix mailbox archives) via `postal-mime` with streaming 4 MB `.mbox` boundary scanning and lazy body loading.
 - **XSS & Privacy Protection:**
@@ -14,7 +14,7 @@
   - Resolves inline `cid:` attachments locally via `Blob` URLs while blocking external `http://` / `https://` images and tracking pixels by default (with a user-togglable banner).
 - **Three-Pane Mail Client:**
   - **Folder Tree:** Collapsible folder hierarchy with unread/total counts, folder search filter, and a virtual `Imported Messages` bucket for standalone `.msg`/`.eml` drops.
-  - **Virtualized Message List:** Smoothly handles 50,000+ messages with instant full-text search, date-range filtering, attachment filter, keyboard navigation (`Up`/`Down`, `Esc`), and folder `.zip` export.
+  - **Virtualized Message List:** Fixed-height DOM virtualization smoothly handles 100,000+ messages with streamed 500-header batching, **Current Folder** / **All Folders** search scope toggle, folder path badges, streaming **"Search inside email bodies"** with live progress & Cancel, date-range and attachment filters, keyboard navigation (`Up`/`Down`, `Esc`), and folder `.zip` export.
   - **Reading Pane:** Full header inspection + expandable raw internet headers, one-click attachment downloads & **Download All as ZIP**, **HTML / Plain Text / Raw Source & MAPI Properties** tabs, **Print / Save as PDF**, and **Export as .eml**.
 - **Self-Contained & Air-Gapped Bundle:** All fonts (`@fontsource-variable/inter`, `@fontsource-variable/jetbrains-mono`) and icons (`lucide-react`) are bundled locally—zero external CDNs or analytics.
 

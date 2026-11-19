@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DropzoneScreen } from './components/DropzoneScreen';
 import { MailWorkspace } from './components/MailWorkspace';
+import type { ListScanProgress } from './components/MessageList';
 import { TopBar } from './components/TopBar';
 import type {
   FolderNode,
@@ -19,7 +20,7 @@ import {
   resolveEffectiveTheme,
   type ColorSchemePreference,
 } from './utils/theme';
-import { MailWorkerClient } from './worker/workerClient';
+import { MailWorkerClient, type StreamHandle } from './worker/workerClient';
 
 function findFolderName(nodes: FolderNode[], id: string | null): string {
   if (!id) return 'Messages';
@@ -31,9 +32,22 @@ function findFolderName(nodes: FolderNode[], id: string | null): string {
   return 'Messages';
 }
 
+const DEFAULT_FILTER: SearchFilter = {
+  folderId: '',
+  scope: 'folder',
+  searchBodies: false,
+  query: '',
+  dateFrom: '',
+  dateTo: '',
+  hasAttachmentsOnly: false,
+};
+
 export default function App() {
   const workerRef = useRef<MailWorkerClient | null>(null);
   const activeObjectUrlsRef = useRef<Set<string>>(new Set());
+  const activeStreamRef = useRef<StreamHandle | null>(null);
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const selectedMessageIdRef = useRef<string | null>(null);
 
   if (!workerRef.current) {
     workerRef.current = new MailWorkerClient();
@@ -52,20 +66,37 @@ export default function App() {
   const [selectedMessageId, setSelectedMessageId] = useState<string | null>(null);
   const [activeDetail, setActiveDetail] = useState<MessageDetail | null>(null);
 
-  const [filter, setFilter] = useState<SearchFilter>({
-    folderId: '',
-    query: '',
-    dateFrom: '',
-    dateTo: '',
-    hasAttachmentsOnly: false,
-  });
+  const [filter, setFilter] = useState<SearchFilter>(DEFAULT_FILTER);
 
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [isFolderLoading, setIsFolderLoading] = useState(false);
+  const [scanProgress, setScanProgress] = useState<ListScanProgress | null>(null);
   const [isMessageLoading, setIsMessageLoading] = useState(false);
   const [isExportingZip, setIsExportingZip] = useState(false);
   const [progressText, setProgressText] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
+
+  selectedMessageIdRef.current = selectedMessageId;
+
+  const revokeAllActiveObjectUrls = useCallback(() => {
+    for (const url of activeObjectUrlsRef.current) {
+      URL.revokeObjectURL(url);
+    }
+    activeObjectUrlsRef.current.clear();
+  }, []);
+
+  const cancelActiveStream = useCallback(() => {
+    if (searchDebounceRef.current) {
+      clearTimeout(searchDebounceRef.current);
+      searchDebounceRef.current = null;
+    }
+    if (activeStreamRef.current) {
+      activeStreamRef.current.cancel();
+      activeStreamRef.current = null;
+    }
+    setScanProgress(null);
+    setIsFolderLoading(false);
+  }, []);
 
   useEffect(() => {
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
@@ -80,10 +111,7 @@ export default function App() {
     window.addEventListener('storage', onStorage);
 
     const onUnload = () => {
-      for (const url of activeObjectUrlsRef.current) {
-        URL.revokeObjectURL(url);
-      }
-      activeObjectUrlsRef.current.clear();
+      revokeAllActiveObjectUrls();
       workerRef.current?.dispose();
     };
     window.addEventListener('beforeunload', onUnload);
@@ -93,7 +121,7 @@ export default function App() {
       window.removeEventListener('storage', onStorage);
       window.removeEventListener('beforeunload', onUnload);
     };
-  }, []);
+  }, [revokeAllActiveObjectUrls]);
 
   const handleColorSchemeChange = (pref: ColorSchemePreference) => {
     setColorScheme(pref);
@@ -122,42 +150,93 @@ export default function App() {
     }
   }, []);
 
-  const loadFolderAndFirstMessage = useCallback(
-    async (folderId: string) => {
+  const handleSelectMessage = useCallback(
+    async (messageId: string) => {
       const client = workerRef.current;
       if (!client) return;
 
-      setSelectedFolderId(folderId);
-      setFilter({
-        folderId,
-        query: '',
-        dateFrom: '',
-        dateTo: '',
-        hasAttachmentsOnly: false,
-      });
-      setIsFolderLoading(true);
-      setActiveDetail(null);
-      setSelectedMessageId(null);
+      // Immediately revoke any Blob URLs belonging to the previous email
+      revokeAllActiveObjectUrls();
 
+      setSelectedMessageId(messageId);
+      setIsMessageLoading(true);
       try {
-        const list = await client.getFolderMessages(folderId, handleProgress);
-        setMessages(list);
-        if (list.length > 0) {
-          setSelectedMessageId(list[0].id);
-          setIsMessageLoading(true);
-          const detail = await client.getMessageDetail(list[0].id);
+        const detail = await client.getMessageDetail(messageId);
+        if (selectedMessageIdRef.current === messageId) {
           setActiveDetail(detail);
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setWarnings((prev) => [...prev, msg]);
       } finally {
-        setIsFolderLoading(false);
-        setIsMessageLoading(false);
-        setProgressText(null);
+        if (selectedMessageIdRef.current === messageId) {
+          setIsMessageLoading(false);
+        }
       }
     },
-    [handleProgress],
+    [revokeAllActiveObjectUrls],
+  );
+
+  const streamFolder = useCallback(
+    (folderId: string) => {
+      const client = workerRef.current;
+      if (!client) return;
+
+      cancelActiveStream();
+      revokeAllActiveObjectUrls();
+
+      setSelectedFolderId(folderId);
+      setFilter({ ...DEFAULT_FILTER, folderId });
+      setMessages([]);
+      setActiveDetail(null);
+      setSelectedMessageId(null);
+      setIsFolderLoading(true);
+      setScanProgress({
+        mode: 'folder',
+        scannedFolders: 0,
+        totalFolders: 1,
+        scannedMessages: 0,
+        totalMessages: 0,
+      });
+
+      let firstBatchHandled = false;
+      const handle = client.streamFolderMessages(folderId, (update) => {
+        if (activeStreamRef.current?.requestId !== handle.requestId) return;
+
+        if (update.batch.length > 0) {
+          setMessages((prev) => [...prev, ...update.batch]);
+          if (!firstBatchHandled) {
+            firstBatchHandled = true;
+            void handleSelectMessage(update.batch[0].id);
+          }
+        }
+
+        if (update.done) {
+          setIsFolderLoading(false);
+          setScanProgress(null);
+          activeStreamRef.current = null;
+        } else {
+          setScanProgress({
+            mode: 'folder',
+            scannedFolders: 0,
+            totalFolders: 1,
+            scannedMessages: update.loadedCount,
+            totalMessages: update.totalCount,
+          });
+        }
+      });
+
+      activeStreamRef.current = handle;
+      handle.promise.catch((err) => {
+        if (activeStreamRef.current?.requestId === handle.requestId) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setWarnings((prev) => [...prev, msg]);
+          setIsFolderLoading(false);
+          setScanProgress(null);
+        }
+      });
+    },
+    [cancelActiveStream, handleSelectMessage, revokeAllActiveObjectUrls],
   );
 
   const handleFilesSelected = async (files: File[]) => {
@@ -175,7 +254,7 @@ export default function App() {
       }
       const targetFolder = selectedFolderId || res.defaultFolderId;
       if (targetFolder) {
-        await loadFolderAndFirstMessage(targetFolder);
+        streamFolder(targetFolder);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -191,43 +270,91 @@ export default function App() {
     void handleFilesSelected([sampleFile]);
   };
 
-  const handleSelectMessage = useCallback(async (messageId: string) => {
-    const client = workerRef.current;
-    if (!client) return;
-    setSelectedMessageId(messageId);
-    setIsMessageLoading(true);
-    try {
-      const detail = await client.getMessageDetail(messageId);
-      setActiveDetail(detail);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setWarnings((prev) => [...prev, msg]);
-    } finally {
-      setIsMessageLoading(false);
-    }
-  }, []);
+  const runSearchStream = useCallback(
+    (nextFilter: SearchFilter) => {
+      const client = workerRef.current;
+      if (!client) return;
+
+      const isEmptyFolderFilter =
+        nextFilter.scope === 'folder' &&
+        !nextFilter.query.trim() &&
+        !nextFilter.dateFrom &&
+        !nextFilter.dateTo &&
+        !nextFilter.hasAttachmentsOnly;
+
+      if (isEmptyFolderFilter) {
+        if (nextFilter.folderId) {
+          streamFolder(nextFilter.folderId);
+        }
+        return;
+      }
+
+      cancelActiveStream();
+      setMessages([]);
+      setIsFolderLoading(true);
+      setScanProgress({
+        mode: 'search',
+        scannedFolders: 0,
+        totalFolders: 0,
+        scannedMessages: 0,
+        totalMessages: 0,
+      });
+
+      const handle = client.streamSearchMessages(nextFilter, (update) => {
+        if (activeStreamRef.current?.requestId !== handle.requestId) return;
+
+        if (update.batch.length > 0) {
+          setMessages((prev) => [...prev, ...update.batch]);
+        }
+
+        if (update.done) {
+          setIsFolderLoading(false);
+          setScanProgress(null);
+          activeStreamRef.current = null;
+        } else {
+          setScanProgress({
+            mode: 'search',
+            scannedFolders: update.scannedFolders,
+            totalFolders: update.totalFolders,
+            scannedMessages: update.scannedMessages,
+            totalMessages: update.totalMessages,
+          });
+        }
+      });
+
+      activeStreamRef.current = handle;
+      handle.promise.catch((err) => {
+        if (activeStreamRef.current?.requestId === handle.requestId) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setWarnings((prev) => [...prev, msg]);
+          setIsFolderLoading(false);
+          setScanProgress(null);
+        }
+      });
+    },
+    [cancelActiveStream, streamFolder],
+  );
 
   const handleFilterChange = useCallback(
-    async (partial: Partial<SearchFilter>) => {
-      const client = workerRef.current;
-      if (!client || !selectedFolderId) return;
+    (partial: Partial<SearchFilter>) => {
+      if (!selectedFolderId && partial.scope !== 'archive') return;
 
       const next: SearchFilter = {
         ...filter,
         ...partial,
-        folderId: selectedFolderId,
+        folderId: selectedFolderId || filter.folderId,
       };
       setFilter(next);
 
-      try {
-        const results = await client.searchMessages(next);
-        setMessages(results);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        setWarnings((prev) => [...prev, msg]);
+      if (searchDebounceRef.current) {
+        clearTimeout(searchDebounceRef.current);
       }
+      const delay = next.searchBodies ? 350 : 180;
+      searchDebounceRef.current = setTimeout(() => {
+        runSearchStream(next);
+      }, delay);
     },
-    [filter, selectedFolderId],
+    [filter, runSearchStream, selectedFolderId],
   );
 
   const handleExportEml = async (messageId: string) => {
@@ -259,10 +386,8 @@ export default function App() {
   };
 
   const handleClearSession = async () => {
-    for (const url of activeObjectUrlsRef.current) {
-      URL.revokeObjectURL(url);
-    }
-    activeObjectUrlsRef.current.clear();
+    cancelActiveStream();
+    revokeAllActiveObjectUrls();
 
     await workerRef.current?.resetSession();
     setArchives([]);
@@ -271,6 +396,7 @@ export default function App() {
     setMessages([]);
     setSelectedMessageId(null);
     setActiveDetail(null);
+    setFilter(DEFAULT_FILTER);
     setWarnings([]);
     setProgressText(null);
   };
@@ -310,14 +436,16 @@ export default function App() {
           filter={filter}
           theme={effectiveTheme}
           isFolderLoading={isFolderLoading}
+          scanProgress={scanProgress}
           isMessageLoading={isMessageLoading}
           isExportingZip={isExportingZip}
           progressText={progressText}
           warnings={warnings}
           onDismissWarnings={() => setWarnings([])}
-          onSelectFolder={loadFolderAndFirstMessage}
+          onSelectFolder={streamFolder}
           onSelectMessage={handleSelectMessage}
           onFilterChange={handleFilterChange}
+          onCancelScan={cancelActiveStream}
           onExportEml={handleExportEml}
           onExportFolderZip={handleExportFolderZip}
           registerObjectUrls={registerObjectUrls}

@@ -142,6 +142,7 @@ export async function parseMsgFile(
   const summary: MessageSummary = {
     id: msgId,
     folderId,
+    folderPath: 'Imported Messages',
     archiveId,
     format: 'msg',
     subject,

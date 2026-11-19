@@ -21,7 +21,6 @@ const textEncoder = new TextEncoder();
 export interface ParsedEmlRecord {
   summary: MessageSummary;
   detail: MessageDetail;
-  searchText: string;
 }
 
 export interface MboxMessageSpan {
@@ -29,7 +28,6 @@ export interface MboxMessageSpan {
   start: number;
   end: number;
   summary: MessageSummary;
-  searchText: string;
 }
 
 export interface MboxArchiveSession {
@@ -75,13 +73,14 @@ function convertPostalMimeEmail(
   meta: {
     id: string;
     folderId: string;
+    folderPath: string;
     archiveId: string;
     format: 'eml' | 'mbox';
     size: number;
     fallbackSubject: string;
     fallbackTimestamp: number;
   },
-): { summary: MessageSummary; detail: MessageDetail; searchText: string } {
+): { summary: MessageSummary; detail: MessageDetail } {
   const fromList = parsed.from ? flattenAddresses([parsed.from]) : [];
   const from: EmailAddress = fromList[0] ?? { name: 'Unknown Sender', address: '' };
   const to = flattenAddresses(parsed.to);
@@ -114,6 +113,7 @@ function convertPostalMimeEmail(
   const summary: MessageSummary = {
     id: meta.id,
     folderId: meta.folderId,
+    folderPath: meta.folderPath,
     archiveId: meta.archiveId,
     format: meta.format,
     subject,
@@ -141,9 +141,7 @@ function convertPostalMimeEmail(
     attachments,
   };
 
-  const searchText = `${subject}\n${summary.senderName}\n${summary.senderAddress}\n${toSummary}\n${textBody.slice(0, 20000)}`.toLowerCase();
-
-  return { summary, detail, searchText };
+  return { summary, detail };
 }
 
 export async function parseEmlFile(
@@ -157,6 +155,7 @@ export async function parseEmlFile(
   return convertPostalMimeEmail(parsed, rawText, {
     id: `${archiveId}:eml:0`,
     folderId,
+    folderPath: 'Imported Messages',
     archiveId,
     format: 'eml',
     size: file.size,
@@ -166,12 +165,10 @@ export async function parseEmlFile(
 }
 
 function unescapeMboxFromLines(raw: string): string {
-  // RFC 4155 / mboxo unescaping: ">From " at start of line -> "From "
   return raw.replace(/^>(>*From )/gm, '$1');
 }
 
 function findNextFromLine(bytes: Uint8Array, fromPos: number): number {
-  // Search for "\nFrom " (0x0A 0x46 0x72 0x6F 0x6D 0x20)
   for (let i = fromPos; i <= bytes.length - 6; i += 1) {
     if (
       bytes[i] === 0x0a &&
@@ -195,9 +192,8 @@ function findLineEnd(bytes: Uint8Array, start: number): number {
 }
 
 /**
- * Scans an `.mbox` file in 4 MB chunks using `File.slice()` to index message byte spans
- * without retaining full raw bodies in memory, then lazily parses each message via PostalMime
- * when selected in the reading pane.
+ * Scans an `.mbox` file in 4 MB chunks via `File.slice()` and reads only header slices
+ * during indexing—never holding full bodies or raw search strings in RAM.
  */
 export async function indexMboxFile(
   file: File,
@@ -254,25 +250,23 @@ export async function indexMboxFile(
   const messages: MessageSummary[] = [];
   const spansById = new Map<string, MboxMessageSpan>();
 
-  // Parse headers + snippet for each message span lazily via small bounded slice if huge, or full span for normal messages
   for (let i = 0; i < spans.length; i += 1) {
     const span = spans[i];
     const spanSize = span.end - span.start;
     const msgId = `${folderId}:msg:${i}`;
 
-    // For initial listing, inspect up to 256 KB per message to keep memory bounded even on 20 MB attachments
-    const previewBytesLen = Math.min(spanSize, 256 * 1024);
+    // Read small header/preamble slice only so multi-GB mbox indexing stays lightweight
+    const previewBytesLen = Math.min(spanSize, 64 * 1024);
     const previewBuf = await file.slice(span.start, span.start + previewBytesLen).arrayBuffer();
     const previewRaw = unescapeMboxFromLines(textDecoder.decode(new Uint8Array(previewBuf)));
 
     let summary: MessageSummary;
-    let searchText = '';
-
     try {
       const parsed = await PostalMime.parse(previewRaw);
       const converted = convertPostalMimeEmail(parsed, previewRaw, {
         id: msgId,
         folderId,
+        folderPath: file.name,
         archiveId,
         format: 'mbox',
         size: spanSize,
@@ -280,11 +274,11 @@ export async function indexMboxFile(
         fallbackTimestamp: file.lastModified,
       });
       summary = converted.summary;
-      searchText = converted.searchText;
     } catch {
       summary = {
         id: msgId,
         folderId,
+        folderPath: file.name,
         archiveId,
         format: 'mbox',
         subject: `Message #${i + 1}`,
@@ -306,7 +300,6 @@ export async function indexMboxFile(
       start: span.start,
       end: span.end,
       summary,
-      searchText,
     });
   }
 
@@ -347,6 +340,7 @@ export async function loadMboxMessageDetail(
   const { detail } = convertPostalMimeEmail(parsed, rawSource, {
     id: messageId,
     folderId: session.folderNode.id,
+    folderPath: session.file.name,
     archiveId: session.archiveId,
     format: 'mbox',
     size: span.end - span.start,
@@ -355,4 +349,16 @@ export async function loadMboxMessageDetail(
   });
 
   return detail;
+}
+
+export async function readMboxMessageBodyText(
+  session: MboxArchiveSession,
+  messageId: string,
+): Promise<string> {
+  const span = session.spansById.get(messageId);
+  if (!span) return '';
+  const buf = await session.file.slice(span.start, span.end).arrayBuffer();
+  const rawSource = unescapeMboxFromLines(textDecoder.decode(new Uint8Array(buf)));
+  const parsed = await PostalMime.parse(rawSource);
+  return (parsed.text || '').trim() || (parsed.html ? stripHtmlToText(parsed.html) : '');
 }

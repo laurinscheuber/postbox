@@ -2,6 +2,10 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import {
   Calendar,
   Download,
+  FileSearch,
+  Folder,
+  FolderTree as FolderTreeIcon,
+  Layers,
   Loader2,
   Paperclip,
   Search,
@@ -12,15 +16,25 @@ import { useEffect, useRef, useState } from 'react';
 import type { MessageSummary, SearchFilter } from '../types/mail';
 import { formatShortDate } from '../utils/formatters';
 
+export interface ListScanProgress {
+  mode: 'folder' | 'search';
+  scannedFolders: number;
+  totalFolders: number;
+  scannedMessages: number;
+  totalMessages: number;
+}
+
 interface MessageListProps {
   folderName: string;
   messages: MessageSummary[];
   selectedMessageId: string | null;
   filter: SearchFilter;
   isLoading: boolean;
+  scanProgress: ListScanProgress | null;
   isExportingZip: boolean;
   onSelectMessage: (messageId: string) => void;
   onFilterChange: (next: Partial<SearchFilter>) => void;
+  onCancelScan: () => void;
   onExportFolderZip: () => void;
 }
 
@@ -30,21 +44,31 @@ export function MessageList({
   selectedMessageId,
   filter,
   isLoading,
+  scanProgress,
   isExportingZip,
   onSelectMessage,
   onFilterChange,
+  onCancelScan,
   onExportFolderZip,
 }: MessageListProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [showFilters, setShowFilters] = useState(false);
 
+  const isGlobalScope = filter.scope === 'archive';
+  const rowHeight = isGlobalScope ? 104 : 84;
+
   const virtualizer = useVirtualizer({
     count: messages.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => 86,
+    estimateSize: () => rowHeight,
     overscan: 12,
   });
+
+  // Re-measure when switching between folder and global scope (which shows folder badge)
+  useEffect(() => {
+    virtualizer.measure();
+  }, [rowHeight, virtualizer]);
 
   // Global & list keyboard navigation: Up/Down moves selection, Esc clears search
   useEffect(() => {
@@ -54,12 +78,21 @@ export function MessageList({
         target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable;
 
       if (e.key === 'Escape') {
-        if (filter.query || filter.dateFrom || filter.dateTo || filter.hasAttachmentsOnly) {
+        if (
+          filter.query ||
+          filter.dateFrom ||
+          filter.dateTo ||
+          filter.hasAttachmentsOnly ||
+          filter.searchBodies ||
+          filter.scope === 'archive'
+        ) {
           onFilterChange({
             query: '',
             dateFrom: '',
             dateTo: '',
             hasAttachmentsOnly: false,
+            searchBodies: false,
+            scope: 'folder',
           });
           searchInputRef.current?.blur();
         }
@@ -94,11 +127,17 @@ export function MessageList({
     Boolean(filter.query) ||
     Boolean(filter.dateFrom) ||
     Boolean(filter.dateTo) ||
-    filter.hasAttachmentsOnly;
+    filter.hasAttachmentsOnly ||
+    filter.scope === 'archive';
+
+  const progressPercent =
+    scanProgress && scanProgress.totalMessages > 0
+      ? Math.min(100, Math.round((scanProgress.scannedMessages / scanProgress.totalMessages) * 100))
+      : null;
 
   return (
     <section
-      className="no-print workspace-pane flex h-full w-88 shrink-0 flex-col border-r lg:w-96"
+      className="no-print workspace-pane flex h-full w-88 shrink-0 flex-col border-r lg:w-[26rem]"
       style={{
         backgroundColor: 'var(--pb-bg-surface)',
         borderColor: 'var(--pb-border)',
@@ -108,7 +147,9 @@ export function MessageList({
       <div className="space-y-2 border-b p-3" style={{ borderColor: 'var(--pb-border)' }}>
         <div className="flex items-center justify-between gap-2">
           <div className="min-w-0">
-            <h2 className="truncate text-sm font-semibold">{folderName}</h2>
+            <h2 className="truncate text-sm font-semibold">
+              {isGlobalScope ? 'Entire Archive Search' : folderName}
+            </h2>
             <p className="text-[11px]" style={{ color: 'var(--pb-text-muted)' }}>
               {messages.length.toLocaleString()} {messages.length === 1 ? 'message' : 'messages'}
               {hasActiveFilter ? ' (filtered)' : ''}
@@ -124,7 +165,7 @@ export function MessageList({
               borderColor: 'var(--pb-border)',
               backgroundColor: 'var(--pb-bg-muted)',
             }}
-            title="Export all messages in this folder as .eml files inside a ZIP archive"
+            title="Export all messages in the selected folder as .eml files inside a ZIP archive"
           >
             {isExportingZip ? (
               <Loader2 className="h-3 w-3 animate-spin" />
@@ -135,6 +176,7 @@ export function MessageList({
           </button>
         </div>
 
+        {/* Search bar + quick scope toggle */}
         <div className="flex items-center gap-1.5">
           <div
             className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md border px-2.5 py-1.5"
@@ -149,7 +191,11 @@ export function MessageList({
               type="text"
               value={filter.query}
               onChange={(e) => onFilterChange({ query: e.target.value })}
-              placeholder="Search sender, subject, body… (Esc)"
+              placeholder={
+                filter.searchBodies
+                  ? 'Search headers & email bodies…'
+                  : 'Search sender, subject, recipient, date…'
+              }
               aria-label="Search messages"
               className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-slate-400"
             />
@@ -207,6 +253,72 @@ export function MessageList({
           </button>
         </div>
 
+        {/* Scope & Streaming Body Search Controls */}
+        <div className="flex flex-wrap items-center justify-between gap-1.5 text-[11px]">
+          <div
+            className="inline-flex rounded-md border p-0.5"
+            style={{
+              borderColor: 'var(--pb-border)',
+              backgroundColor: 'var(--pb-bg-muted)',
+            }}
+            role="group"
+            aria-label="Search scope"
+          >
+            <button
+              type="button"
+              onClick={() => onFilterChange({ scope: 'folder' })}
+              aria-pressed={filter.scope === 'folder'}
+              className="inline-flex items-center gap-1 rounded px-2 py-0.5 font-medium transition-colors"
+              style={{
+                backgroundColor:
+                  filter.scope === 'folder' ? 'var(--pb-bg-surface)' : 'transparent',
+                color:
+                  filter.scope === 'folder'
+                    ? 'var(--pb-text-primary)'
+                    : 'var(--pb-text-muted)',
+              }}
+            >
+              <FolderTreeIcon className="h-3 w-3" />
+              <span>Current Folder</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onFilterChange({ scope: 'archive' })}
+              aria-pressed={filter.scope === 'archive'}
+              className="inline-flex items-center gap-1 rounded px-2 py-0.5 font-medium transition-colors"
+              style={{
+                backgroundColor:
+                  filter.scope === 'archive' ? 'var(--pb-bg-surface)' : 'transparent',
+                color:
+                  filter.scope === 'archive'
+                    ? 'var(--pb-text-primary)'
+                    : 'var(--pb-text-muted)',
+              }}
+            >
+              <Layers className="h-3 w-3" />
+              <span>All Folders</span>
+            </button>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => onFilterChange({ searchBodies: !filter.searchBodies })}
+            aria-pressed={filter.searchBodies}
+            className="inline-flex items-center gap-1 rounded-md border px-2 py-1 font-medium transition-colors"
+            style={{
+              borderColor: filter.searchBodies ? 'var(--pb-accent)' : 'var(--pb-border)',
+              backgroundColor: filter.searchBodies
+                ? 'var(--pb-bg-selected)'
+                : 'var(--pb-bg-muted)',
+              color: filter.searchBodies ? 'var(--pb-accent)' : 'var(--pb-text-secondary)',
+            }}
+            title="Stream message bodies inside the Web Worker without retaining them in RAM"
+          >
+            <FileSearch className="h-3 w-3" />
+            <span>Search inside email bodies</span>
+          </button>
+        </div>
+
         {showFilters && (
           <div
             className="grid grid-cols-2 gap-2 rounded-md border p-2 text-[11px]"
@@ -241,13 +353,67 @@ export function MessageList({
             </label>
           </div>
         )}
+
+        {/* Live Progressive Loading / Streaming Search Indicator + Cancel */}
+        {scanProgress && (
+          <div
+            className="space-y-1.5 rounded-md border p-2 text-[11px]"
+            style={{
+              borderColor: 'var(--pb-border)',
+              backgroundColor: 'var(--pb-bg-selected)',
+            }}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex min-w-0 items-center gap-1.5">
+                <Loader2 className="h-3 w-3 shrink-0 animate-spin" style={{ color: 'var(--pb-accent)' }} />
+                <span className="truncate font-medium">
+                  {scanProgress.mode === 'folder'
+                    ? `Loading headers: ${scanProgress.scannedMessages.toLocaleString()}${
+                        scanProgress.totalMessages > 0
+                          ? ` / ${scanProgress.totalMessages.toLocaleString()}`
+                          : ''
+                      }`
+                    : scanProgress.totalFolders > 1
+                      ? `Scanned ${scanProgress.scannedFolders} / ${scanProgress.totalFolders} folders · ${scanProgress.scannedMessages.toLocaleString()} msgs`
+                      : `Scanning ${scanProgress.scannedMessages.toLocaleString()}${
+                          scanProgress.totalMessages > 0
+                            ? ` / ${scanProgress.totalMessages.toLocaleString()}`
+                            : ''
+                        } messages`}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={onCancelScan}
+                className="shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-semibold hover:opacity-80"
+                style={{
+                  borderColor: 'var(--pb-border)',
+                  backgroundColor: 'var(--pb-bg-surface)',
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+            {progressPercent !== null && (
+              <div className="h-1 w-full overflow-hidden rounded-full bg-black/10 dark:bg-white/10">
+                <div
+                  className="h-full transition-all duration-150"
+                  style={{
+                    width: `${progressPercent}%`,
+                    backgroundColor: 'var(--pb-accent)',
+                  }}
+                />
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       <div ref={scrollRef} className="relative flex-1 overflow-y-auto" role="listbox" aria-label="Messages">
-        {isLoading ? (
+        {isLoading && messages.length === 0 ? (
           <div className="flex h-40 items-center justify-center gap-2 text-xs" style={{ color: 'var(--pb-text-muted)' }}>
             <Loader2 className="h-4 w-4 animate-spin" />
-            <span>Loading folder messages…</span>
+            <span>Streaming headers…</span>
           </div>
         ) : messages.length === 0 ? (
           <div className="px-6 py-12 text-center text-xs" style={{ color: 'var(--pb-text-muted)' }}>
@@ -273,9 +439,9 @@ export function MessageList({
                   role="option"
                   aria-selected={isSelected}
                   onClick={() => onSelectMessage(msg.id)}
-                  className="absolute top-0 left-0 flex w-full flex-col gap-1 border-b px-3.5 py-2.5 text-left transition-colors"
+                  className="absolute top-0 left-0 flex w-full flex-col justify-center gap-0.5 border-b px-3.5 py-2 text-left transition-colors"
                   style={{
-                    height: `${row.size}px`,
+                    height: `${rowHeight}px`,
                     transform: `translateY(${row.start}px)`,
                     borderColor: 'var(--pb-border)',
                     backgroundColor: isSelected ? 'var(--pb-bg-selected)' : 'transparent',
@@ -314,8 +480,24 @@ export function MessageList({
                   </div>
 
                   <div className="truncate text-[11px]" style={{ color: 'var(--pb-text-secondary)' }}>
-                    {msg.snippet || '\u00A0'}
+                    {msg.snippet || (msg.toSummary ? `To: ${msg.toSummary}` : '\u00A0')}
                   </div>
+
+                  {isGlobalScope && (
+                    <div className="mt-0.5 flex items-center">
+                      <span
+                        className="inline-flex max-w-full items-center gap-1 truncate rounded px-1.5 py-0.25 text-[10px] font-medium"
+                        style={{
+                          backgroundColor: 'var(--pb-bg-muted)',
+                          color: 'var(--pb-text-muted)',
+                        }}
+                        title={msg.folderPath}
+                      >
+                        <Folder className="h-2.5 w-2.5 shrink-0" />
+                        <span className="truncate">{msg.folderPath}</span>
+                      </span>
+                    </div>
+                  )}
                 </button>
               );
             })}

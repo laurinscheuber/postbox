@@ -45,6 +45,8 @@ export function TopBar({
   }, [showSecurityModal]);
 
   const totalSize = archives.reduce((acc, item) => acc + item.size, 0);
+  const isLargeStreamingArchive =
+    totalSize >= 1_000_000_000 || archives.some((a) => a.size >= 1_000_000_000);
 
   return (
     <>
@@ -119,13 +121,28 @@ export function TopBar({
           </button>
 
           {archives.length > 0 && (
-            <span
-              className="hidden truncate text-xs xl:inline"
-              style={{ color: 'var(--pb-text-muted)' }}
-              title={archives.map((a) => `${a.name} (${formatBytes(a.size)})`).join(', ')}
-            >
-              {archives.length} {archives.length === 1 ? 'archive' : 'archives'} ({formatBytes(totalSize)})
-            </span>
+            isLargeStreamingArchive ? (
+              <span
+                className="hidden items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-medium xl:inline-flex"
+                style={{
+                  borderColor: 'var(--pb-border)',
+                  backgroundColor: 'var(--pb-bg-muted)',
+                  color: 'var(--pb-text-secondary)',
+                }}
+                title="Reading via 64 KB paged File.slice() blocks with a 128 MB LRU cache"
+              >
+                <span className="h-1.5 w-1.5 rounded-full bg-sky-500" />
+                <span>{formatBytes(totalSize)} • Streaming Local Disk I/O</span>
+              </span>
+            ) : (
+              <span
+                className="hidden truncate text-xs xl:inline"
+                style={{ color: 'var(--pb-text-muted)' }}
+                title={archives.map((a) => `${a.name} (${formatBytes(a.size)})`).join(', ')}
+              >
+                {archives.length} {archives.length === 1 ? 'archive' : 'archives'} ({formatBytes(totalSize)})
+              </span>
+            )
           )}
         </div>
 

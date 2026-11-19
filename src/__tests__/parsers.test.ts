@@ -46,6 +46,7 @@ describe('EML & MBOX parsing and RFC 5322 export', () => {
     const emlBytes = serializeMessageToEml({
       id: 'msg-synthetic-1',
       folderId: 'f1',
+      folderPath: 'Inbox',
       archiveId: 'a1',
       format: 'pst',
       subject: 'Quartalsbericht Zürich Q4',

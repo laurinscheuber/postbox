@@ -14,14 +14,17 @@ import {
   indexMboxFile,
   loadMboxMessageDetail,
   parseEmlFile,
+  readMboxMessageBodyText,
   type MboxArchiveSession,
   type ParsedEmlRecord,
 } from './parsers/emlMboxAdapter';
 import { parseMsgFile, type ParsedMsgRecord } from './parsers/msgAdapter';
 import {
-  loadPstFolderMessages,
   loadPstMessageDetail,
   openPstArchive,
+  parsePstMessageId,
+  readPstMessageBodyText,
+  streamPstFolderHeaders,
   type PstArchiveSession,
 } from './parsers/pstAdapter';
 
@@ -35,10 +38,12 @@ const mboxSessions = new Map<string, MboxArchiveSession>();
 const importedRecords = new Map<string, ParsedMsgRecord | ParsedEmlRecord>();
 const importedOrder: string[] = [];
 const loadedArchives: LoadedArchiveInfo[] = [];
-const searchTextIndex = new Map<string, string>();
 const folderToArchive = new Map<string, { kind: 'pst' | 'mbox'; archiveId: string }>();
+const cancelledRequests = new Set<string>();
 
 let archiveSeq = 0;
+
+const yieldTick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 function post(response: WorkerResponse, transfer?: Transferable[]): void {
   if (transfer && transfer.length > 0) {
@@ -95,25 +100,12 @@ function getImportedSummaries(): MessageSummary[] {
   return list.sort((a, b) => b.timestamp - a.timestamp);
 }
 
-async function resolveFolderMessages(
-  folderId: string,
-  requestId: string,
-): Promise<MessageSummary[]> {
-  if (folderId === VIRTUAL_IMPORTED_FOLDER_ID) {
-    return getImportedSummaries();
+function countPstTotalMessages(session: PstArchiveSession): number {
+  let total = 0;
+  for (const meta of session.foldersById.values()) {
+    total += meta.node.totalCount;
   }
-  const ref = folderToArchive.get(folderId);
-  if (!ref) return [];
-
-  if (ref.kind === 'mbox') {
-    return mboxSessions.get(ref.archiveId)?.messages ?? [];
-  }
-
-  const pst = pstSessions.get(ref.archiveId);
-  if (!pst) return [];
-  return await loadPstFolderMessages(pst, folderId, searchTextIndex, (current, total) => {
-    emitProgress(requestId, 'Indexing folder messages…', current, total);
-  });
+  return total;
 }
 
 async function resolveMessageDetail(messageId: string): Promise<MessageDetail | null> {
@@ -128,45 +120,373 @@ async function resolveMessageDetail(messageId: string): Promise<MessageDetail | 
     }
   }
 
-  for (const pst of pstSessions.values()) {
-    for (const handle of pst.foldersById.values()) {
-      if (handle.messageById.has(messageId)) {
-        return await loadPstMessageDetail(pst, handle.node.id, messageId);
-      }
+  const pstId = parsePstMessageId(messageId);
+  if (pstId) {
+    const pst = pstSessions.get(pstId.archiveId);
+    if (pst) {
+      return await loadPstMessageDetail(pst, messageId);
     }
   }
+
   return null;
 }
 
-function filterMessages(messages: MessageSummary[], filter: SearchFilter): MessageSummary[] {
-  const q = filter.query.trim().toLowerCase();
+async function readMessageBodyForSearch(msg: MessageSummary): Promise<string> {
+  if (msg.format === 'msg' || msg.format === 'eml') {
+    const rec = importedRecords.get(msg.id);
+    return rec?.detail.textBody || rec?.detail.htmlBody || '';
+  }
+  if (msg.format === 'mbox') {
+    const mbox = mboxSessions.get(msg.archiveId);
+    if (!mbox) return '';
+    return await readMboxMessageBodyText(mbox, msg.id);
+  }
+  const pst = pstSessions.get(msg.archiveId);
+  const parsed = parsePstMessageId(msg.id);
+  if (!pst || !parsed) return '';
+  return await readPstMessageBodyText(pst, parsed.msgNid);
+}
+
+function buildMatchSnippet(text: string, queryLower: string): string {
+  const idx = text.toLowerCase().indexOf(queryLower);
+  if (idx === -1) return '';
+  const start = Math.max(0, idx - 45);
+  const end = Math.min(text.length, idx + queryLower.length + 95);
+  const prefix = start > 0 ? '…' : '';
+  const suffix = end < text.length ? '…' : '';
+  return `${prefix}${text.slice(start, end).replace(/\s+/g, ' ').trim()}${suffix}`;
+}
+
+function matchesMetadata(
+  msg: MessageSummary,
+  filter: SearchFilter,
+  queryLower: string,
+  fromTs: number | null,
+  toTs: number | null,
+): { passesPreFilter: boolean; matchesHeaderText: boolean } {
+  if (filter.hasAttachmentsOnly && !msg.hasAttachments) {
+    return { passesPreFilter: false, matchesHeaderText: false };
+  }
+  if (fromTs !== null && !Number.isNaN(fromTs) && (msg.timestamp === 0 || msg.timestamp < fromTs)) {
+    return { passesPreFilter: false, matchesHeaderText: false };
+  }
+  if (toTs !== null && !Number.isNaN(toTs) && (msg.timestamp === 0 || msg.timestamp > toTs)) {
+    return { passesPreFilter: false, matchesHeaderText: false };
+  }
+  if (!queryLower) {
+    return { passesPreFilter: true, matchesHeaderText: true };
+  }
+
+  const headerHit =
+    msg.subject.toLowerCase().includes(queryLower) ||
+    msg.senderName.toLowerCase().includes(queryLower) ||
+    msg.senderAddress.toLowerCase().includes(queryLower) ||
+    msg.toSummary.toLowerCase().includes(queryLower) ||
+    (msg.date ? msg.date.toLowerCase().includes(queryLower) : false) ||
+    msg.snippet.toLowerCase().includes(queryLower);
+
+  return { passesPreFilter: true, matchesHeaderText: headerHit };
+}
+
+async function streamFolderToClient(requestId: string, folderId: string): Promise<void> {
+  const isCancelled = () => cancelledRequests.has(requestId);
+
+  if (folderId === VIRTUAL_IMPORTED_FOLDER_ID) {
+    const all = getImportedSummaries();
+    post({
+      type: 'FOLDER_MESSAGES_BATCH',
+      requestId,
+      folderId,
+      batch: all,
+      loadedCount: all.length,
+      totalCount: all.length,
+      done: true,
+    });
+    return;
+  }
+
+  const ref = folderToArchive.get(folderId);
+  if (!ref) {
+    post({
+      type: 'FOLDER_MESSAGES_BATCH',
+      requestId,
+      folderId,
+      batch: [],
+      loadedCount: 0,
+      totalCount: 0,
+      done: true,
+    });
+    return;
+  }
+
+  if (ref.kind === 'mbox') {
+    const list = mboxSessions.get(ref.archiveId)?.messages ?? [];
+    const CHUNK = 500;
+    if (list.length === 0) {
+      post({
+        type: 'FOLDER_MESSAGES_BATCH',
+        requestId,
+        folderId,
+        batch: [],
+        loadedCount: 0,
+        totalCount: 0,
+        done: true,
+      });
+      return;
+    }
+    for (let i = 0; i < list.length; i += CHUNK) {
+      if (isCancelled()) {
+        post({
+          type: 'FOLDER_MESSAGES_BATCH',
+          requestId,
+          folderId,
+          batch: [],
+          loadedCount: i,
+          totalCount: list.length,
+          done: true,
+          cancelled: true,
+        });
+        return;
+      }
+      const batch = list.slice(i, i + CHUNK);
+      const loadedCount = Math.min(i + batch.length, list.length);
+      const isLast = loadedCount >= list.length;
+      post({
+        type: 'FOLDER_MESSAGES_BATCH',
+        requestId,
+        folderId,
+        batch,
+        loadedCount,
+        totalCount: list.length,
+        done: isLast,
+      });
+      if (!isLast) await yieldTick();
+    }
+    return;
+  }
+
+  const pst = pstSessions.get(ref.archiveId);
+  if (!pst) return;
+
+  let lastCount = 0;
+  let lastTotal = 0;
+  const { cancelled } = await streamPstFolderHeaders(pst, folderId, {
+    batchSize: 500,
+    useCache: true,
+    isCancelled,
+    onBatch: async (batch, loadedCount, totalCount) => {
+      lastCount = loadedCount;
+      lastTotal = totalCount;
+      post({
+        type: 'FOLDER_MESSAGES_BATCH',
+        requestId,
+        folderId,
+        batch,
+        loadedCount,
+        totalCount,
+        done: false,
+      });
+    },
+  });
+
+  post({
+    type: 'FOLDER_MESSAGES_BATCH',
+    requestId,
+    folderId,
+    batch: [],
+    loadedCount: lastCount,
+    totalCount: lastTotal,
+    done: true,
+    cancelled,
+  });
+}
+
+function collectSearchFolderIds(filter: SearchFilter): string[] {
+  if (filter.scope === 'folder') {
+    return filter.folderId ? [filter.folderId] : [];
+  }
+  const ids: string[] = [];
+  if (importedOrder.length > 0) ids.push(VIRTUAL_IMPORTED_FOLDER_ID);
+  for (const pst of pstSessions.values()) {
+    for (const folderId of pst.allFolderIds) {
+      const meta = pst.foldersById.get(folderId);
+      if (meta && meta.node.totalCount > 0) {
+        ids.push(folderId);
+      }
+    }
+  }
+  for (const mbox of mboxSessions.values()) {
+    ids.push(mbox.folderNode.id);
+  }
+  return ids;
+}
+
+async function handleStreamingSearch(requestId: string, filter: SearchFilter): Promise<void> {
+  const isCancelled = () => cancelledRequests.has(requestId);
+  const queryLower = filter.query.trim().toLowerCase();
   const fromTs = filter.dateFrom ? new Date(`${filter.dateFrom}T00:00:00`).getTime() : null;
   const toTs = filter.dateTo ? new Date(`${filter.dateTo}T23:59:59.999`).getTime() : null;
+  const targetFolderIds = collectSearchFolderIds(filter);
 
-  return messages.filter((msg) => {
-    if (filter.hasAttachmentsOnly && !msg.hasAttachments) {
-      return false;
+  const totalFolders = targetFolderIds.length;
+  let totalMessagesEst = 0;
+  for (const fId of targetFolderIds) {
+    if (fId === VIRTUAL_IMPORTED_FOLDER_ID) totalMessagesEst += importedOrder.length;
+    else {
+      const ref = folderToArchive.get(fId);
+      if (ref?.kind === 'mbox') {
+        totalMessagesEst += mboxSessions.get(ref.archiveId)?.messages.length ?? 0;
+      } else if (ref?.kind === 'pst') {
+        totalMessagesEst += pstSessions.get(ref.archiveId)?.foldersById.get(fId)?.node.totalCount ?? 0;
+      }
     }
-    if (fromTs !== null && !Number.isNaN(fromTs) && (msg.timestamp === 0 || msg.timestamp < fromTs)) {
-      return false;
-    }
-    if (toTs !== null && !Number.isNaN(toTs) && (msg.timestamp === 0 || msg.timestamp > toTs)) {
-      return false;
-    }
-    if (!q) return true;
+  }
 
-    const indexed = searchTextIndex.get(msg.id);
-    if (indexed) {
-      return indexed.includes(q);
+  let scannedFolders = 0;
+  let scannedMessages = 0;
+
+  const processBatch = async (headers: MessageSummary[]) => {
+    const matched: MessageSummary[] = [];
+    let bodyReadsInTick = 0;
+
+    for (const msg of headers) {
+      if (isCancelled()) break;
+      scannedMessages += 1;
+
+      const { passesPreFilter, matchesHeaderText } = matchesMetadata(
+        msg,
+        filter,
+        queryLower,
+        fromTs,
+        toTs,
+      );
+      if (!passesPreFilter) continue;
+
+      if (matchesHeaderText) {
+        matched.push(msg);
+        continue;
+      }
+
+      if (filter.searchBodies && queryLower) {
+        // Stream body check for this message and immediately let body string be GC'd
+        const bodyText = await readMessageBodyForSearch(msg);
+        bodyReadsInTick += 1;
+        if (bodyText && bodyText.toLowerCase().includes(queryLower)) {
+          const hitSnippet = buildMatchSnippet(bodyText, queryLower);
+          matched.push(hitSnippet ? { ...msg, snippet: hitSnippet } : msg);
+        }
+        if (bodyReadsInTick >= 25) {
+          bodyReadsInTick = 0;
+          if (matched.length > 0) {
+            post({
+              type: 'SEARCH_RESULTS_BATCH',
+              requestId,
+              batch: matched.splice(0, matched.length),
+              scannedFolders,
+              totalFolders,
+              scannedMessages,
+              totalMessages: Math.max(totalMessagesEst, scannedMessages),
+              done: false,
+            });
+          } else {
+            post({
+              type: 'SEARCH_RESULTS_BATCH',
+              requestId,
+              batch: [],
+              scannedFolders,
+              totalFolders,
+              scannedMessages,
+              totalMessages: Math.max(totalMessagesEst, scannedMessages),
+              done: false,
+            });
+          }
+          await yieldTick();
+        }
+      }
     }
-    return (
-      msg.subject.toLowerCase().includes(q) ||
-      msg.senderName.toLowerCase().includes(q) ||
-      msg.senderAddress.toLowerCase().includes(q) ||
-      msg.toSummary.toLowerCase().includes(q) ||
-      msg.snippet.toLowerCase().includes(q)
-    );
+
+    if (!isCancelled()) {
+      post({
+        type: 'SEARCH_RESULTS_BATCH',
+        requestId,
+        batch: matched,
+        scannedFolders,
+        totalFolders,
+        scannedMessages,
+        totalMessages: Math.max(totalMessagesEst, scannedMessages),
+        done: false,
+      });
+    }
+  };
+
+  for (let fIdx = 0; fIdx < targetFolderIds.length; fIdx += 1) {
+    if (isCancelled()) break;
+    const fId = targetFolderIds[fIdx];
+
+    if (fId === VIRTUAL_IMPORTED_FOLDER_ID) {
+      await processBatch(getImportedSummaries());
+    } else {
+      const ref = folderToArchive.get(fId);
+      if (ref?.kind === 'mbox') {
+        const list = mboxSessions.get(ref.archiveId)?.messages ?? [];
+        for (let i = 0; i < list.length; i += 250) {
+          if (isCancelled()) break;
+          await processBatch(list.slice(i, i + 250));
+          await yieldTick();
+        }
+      } else if (ref?.kind === 'pst') {
+        const pst = pstSessions.get(ref.archiveId);
+        if (pst) {
+          await streamPstFolderHeaders(pst, fId, {
+            batchSize: 500,
+            // Avoid polluting headerCache during full-archive sweeps
+            useCache: filter.scope === 'folder',
+            isCancelled,
+            onBatch: async (batch) => {
+              await processBatch(batch);
+            },
+          });
+        }
+      }
+    }
+
+    scannedFolders = fIdx + 1;
+    await yieldTick();
+  }
+
+  post({
+    type: 'SEARCH_RESULTS_BATCH',
+    requestId,
+    batch: [],
+    scannedFolders,
+    totalFolders,
+    scannedMessages,
+    totalMessages: Math.max(totalMessagesEst, scannedMessages),
+    done: true,
+    cancelled: isCancelled(),
   });
+}
+
+async function collectAllFolderHeadersForExport(folderId: string): Promise<MessageSummary[]> {
+  if (folderId === VIRTUAL_IMPORTED_FOLDER_ID) {
+    return getImportedSummaries();
+  }
+  const ref = folderToArchive.get(folderId);
+  if (!ref) return [];
+  if (ref.kind === 'mbox') {
+    return mboxSessions.get(ref.archiveId)?.messages ?? [];
+  }
+  const pst = pstSessions.get(ref.archiveId);
+  if (!pst) return [];
+  const out: MessageSummary[] = [];
+  await streamPstFolderHeaders(pst, folderId, {
+    batchSize: 500,
+    useCache: false,
+    onBatch: (batch) => {
+      out.push(...batch);
+    },
+  });
+  return out;
 }
 
 async function handleLoadFiles(requestId: string, files: File[]): Promise<void> {
@@ -196,16 +516,12 @@ async function handleLoadFiles(requestId: string, files: File[]): Promise<void> 
           name: file.name,
           format: ext,
           size: file.size,
-          messageCount: Array.from(session.foldersById.values()).reduce(
-            (sum, h) => sum + h.node.totalCount,
-            0,
-          ),
+          messageCount: countPstTotalMessages(session),
         });
       } else if (ext === 'msg') {
         const parsed = await parseMsgFile(file, archiveId, VIRTUAL_IMPORTED_FOLDER_ID);
         importedRecords.set(parsed.summary.id, parsed);
         importedOrder.push(parsed.summary.id);
-        searchTextIndex.set(parsed.summary.id, parsed.searchText);
         if (!defaultFolderId) defaultFolderId = VIRTUAL_IMPORTED_FOLDER_ID;
         loadedArchives.push({
           id: archiveId,
@@ -218,7 +534,6 @@ async function handleLoadFiles(requestId: string, files: File[]): Promise<void> 
         const parsed = await parseEmlFile(file, archiveId, VIRTUAL_IMPORTED_FOLDER_ID);
         importedRecords.set(parsed.summary.id, parsed);
         importedOrder.push(parsed.summary.id);
-        searchTextIndex.set(parsed.summary.id, parsed.searchText);
         if (!defaultFolderId) defaultFolderId = VIRTUAL_IMPORTED_FOLDER_ID;
         loadedArchives.push({
           id: archiveId,
@@ -233,9 +548,6 @@ async function handleLoadFiles(requestId: string, files: File[]): Promise<void> 
         });
         mboxSessions.set(archiveId, session);
         folderToArchive.set(session.folderNode.id, { kind: 'mbox', archiveId });
-        for (const span of session.spansById.values()) {
-          searchTextIndex.set(span.id, span.searchText);
-        }
         if (!defaultFolderId) defaultFolderId = session.folderNode.id;
         loadedArchives.push({
           id: archiveId,
@@ -270,46 +582,40 @@ async function handleLoadFiles(requestId: string, files: File[]): Promise<void> 
 
 async function handleClearSession(requestId: string): Promise<void> {
   for (const pst of pstSessions.values()) {
-    await pst.closeReader().catch(() => undefined);
+    pst.headerCache.clear();
+    pst.engine.clearCaches();
+    await pst.engine.close().catch(() => undefined);
   }
   pstSessions.clear();
   mboxSessions.clear();
   importedRecords.clear();
   importedOrder.length = 0;
   loadedArchives.length = 0;
-  searchTextIndex.clear();
   folderToArchive.clear();
+  cancelledRequests.clear();
   post({ type: 'SESSION_CLEARED', requestId });
 }
 
-self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
-  const req = event.data;
-
+async function dispatchRequest(req: WorkerRequest): Promise<void> {
   try {
     switch (req.type) {
+      case 'CANCEL_TASK': {
+        cancelledRequests.add(req.targetRequestId);
+        post({ type: 'TASK_CANCELLED', requestId: req.requestId });
+        break;
+      }
       case 'LOAD_FILES': {
         await handleLoadFiles(req.requestId, req.files);
         break;
       }
       case 'GET_FOLDER_MESSAGES': {
-        const messages = await resolveFolderMessages(req.folderId, req.requestId);
-        post({
-          type: 'FOLDER_MESSAGES',
-          requestId: req.requestId,
-          folderId: req.folderId,
-          messages,
-        });
+        await streamFolderToClient(req.requestId, req.folderId);
+        cancelledRequests.delete(req.requestId);
         break;
       }
       case 'SEARCH_MESSAGES': {
-        const all = await resolveFolderMessages(req.filter.folderId, req.requestId);
-        const filtered = filterMessages(all, req.filter);
-        post({
-          type: 'SEARCH_RESULTS',
-          requestId: req.requestId,
-          folderId: req.filter.folderId,
-          messages: filtered,
-        });
+        await handleStreamingSearch(req.requestId, req.filter);
+        cancelledRequests.delete(req.requestId);
         break;
       }
       case 'GET_MESSAGE_DETAIL': {
@@ -322,17 +628,17 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           });
           return;
         }
-        post({
-          type: 'MESSAGE_DETAIL',
-          requestId: req.requestId,
-          detail,
-        });
+        post({ type: 'MESSAGE_DETAIL', requestId: req.requestId, detail });
         break;
       }
       case 'EXPORT_EML': {
         const detail = await resolveMessageDetail(req.messageId);
         if (!detail) {
-          post({ type: 'ERROR', requestId: req.requestId, message: 'Message not found for export.' });
+          post({
+            type: 'ERROR',
+            requestId: req.requestId,
+            message: 'Message not found for export.',
+          });
           return;
         }
         const bytes = serializeMessageToEml(detail);
@@ -341,7 +647,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         break;
       }
       case 'EXPORT_FOLDER_ZIP': {
-        const messages = await resolveFolderMessages(req.folderId, req.requestId);
+        const messages = await collectAllFolderHeadersForExport(req.folderId);
         const zip = new JSZip();
         const usedNames = new Map<string, number>();
 
@@ -376,4 +682,8 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     const message = err instanceof Error ? err.message : String(err);
     post({ type: 'ERROR', requestId: req.requestId, message });
   }
+}
+
+self.onmessage = (event: MessageEvent<WorkerRequest>) => {
+  void dispatchRequest(event.data);
 };

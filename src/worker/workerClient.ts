@@ -11,11 +11,38 @@ import type {
 
 type DistributeOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
+export interface FolderStreamUpdate {
+  folderId: string;
+  batch: MessageSummary[];
+  loadedCount: number;
+  totalCount: number;
+  done: boolean;
+  cancelled?: boolean;
+}
+
+export interface SearchStreamUpdate {
+  batch: MessageSummary[];
+  scannedFolders: number;
+  totalFolders: number;
+  scannedMessages: number;
+  totalMessages: number;
+  done: boolean;
+  cancelled?: boolean;
+}
+
 type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (reason?: unknown) => void;
   onProgress?: (event: WorkerProgressEvent) => void;
+  onFolderBatch?: (update: FolderStreamUpdate) => void;
+  onSearchBatch?: (update: SearchStreamUpdate) => void;
 };
+
+export interface StreamHandle {
+  requestId: string;
+  promise: Promise<void>;
+  cancel: () => void;
+}
 
 export class MailWorkerClient {
   private worker: Worker;
@@ -41,6 +68,37 @@ export class MailWorkerClient {
         return;
       }
 
+      if (msg.type === 'FOLDER_MESSAGES_BATCH') {
+        entry.onFolderBatch?.({
+          folderId: msg.folderId,
+          batch: msg.batch,
+          loadedCount: msg.loadedCount,
+          totalCount: msg.totalCount,
+          done: msg.done,
+          cancelled: msg.cancelled,
+        });
+        if (!msg.done) return;
+        this.pending.delete(msg.requestId);
+        entry.resolve(undefined);
+        return;
+      }
+
+      if (msg.type === 'SEARCH_RESULTS_BATCH') {
+        entry.onSearchBatch?.({
+          batch: msg.batch,
+          scannedFolders: msg.scannedFolders,
+          totalFolders: msg.totalFolders,
+          scannedMessages: msg.scannedMessages,
+          totalMessages: msg.totalMessages,
+          done: msg.done,
+          cancelled: msg.cancelled,
+        });
+        if (!msg.done) return;
+        this.pending.delete(msg.requestId);
+        entry.resolve(undefined);
+        return;
+      }
+
       this.pending.delete(msg.requestId);
       if (msg.type === 'ERROR') {
         entry.reject(new Error(msg.message));
@@ -60,22 +118,40 @@ export class MailWorkerClient {
     return worker;
   }
 
-  private send<T extends WorkerResponse>(
+  private send<T>(
     payload: DistributeOmit<WorkerRequest, 'requestId'>,
-    onProgress?: (event: WorkerProgressEvent) => void,
-  ): Promise<T> {
+    callbacks?: {
+      onProgress?: (event: WorkerProgressEvent) => void;
+      onFolderBatch?: (update: FolderStreamUpdate) => void;
+      onSearchBatch?: (update: SearchStreamUpdate) => void;
+    },
+  ): { requestId: string; promise: Promise<T> } {
     this.reqCounter += 1;
     const requestId = `req-${this.reqCounter}`;
     const message = { ...payload, requestId } as WorkerRequest;
 
-    return new Promise<T>((resolve, reject) => {
+    const promise = new Promise<T>((resolve, reject) => {
       this.pending.set(requestId, {
         resolve: resolve as (v: unknown) => void,
         reject,
-        onProgress,
+        onProgress: callbacks?.onProgress,
+        onFolderBatch: callbacks?.onFolderBatch,
+        onSearchBatch: callbacks?.onSearchBatch,
       });
       this.worker.postMessage(message);
     });
+
+    return { requestId, promise };
+  }
+
+  cancelTask(targetRequestId: string): void {
+    this.reqCounter += 1;
+    const requestId = `req-${this.reqCounter}`;
+    this.worker.postMessage({
+      type: 'CANCEL_TASK',
+      requestId,
+      targetRequestId,
+    } satisfies WorkerRequest);
   }
 
   async loadFiles(
@@ -89,8 +165,8 @@ export class MailWorkerClient {
   }> {
     const res = await this.send<Extract<WorkerResponse, { type: 'FILES_LOADED' }>>(
       { type: 'LOAD_FILES', files },
-      onProgress,
-    );
+      { onProgress },
+    ).promise;
     return {
       archives: res.archives,
       folders: res.folders,
@@ -99,33 +175,41 @@ export class MailWorkerClient {
     };
   }
 
-  async getFolderMessages(
+  streamFolderMessages(
     folderId: string,
-    onProgress?: (event: WorkerProgressEvent) => void,
-  ): Promise<MessageSummary[]> {
-    const res = await this.send<Extract<WorkerResponse, { type: 'FOLDER_MESSAGES' }>>(
+    onBatch: (update: FolderStreamUpdate) => void,
+  ): StreamHandle {
+    const { requestId, promise } = this.send<void>(
       { type: 'GET_FOLDER_MESSAGES', folderId },
-      onProgress,
+      { onFolderBatch: onBatch },
     );
-    return res.messages;
+    return {
+      requestId,
+      promise,
+      cancel: () => this.cancelTask(requestId),
+    };
   }
 
-  async searchMessages(
+  streamSearchMessages(
     filter: SearchFilter,
-    onProgress?: (event: WorkerProgressEvent) => void,
-  ): Promise<MessageSummary[]> {
-    const res = await this.send<Extract<WorkerResponse, { type: 'SEARCH_RESULTS' }>>(
+    onBatch: (update: SearchStreamUpdate) => void,
+  ): StreamHandle {
+    const { requestId, promise } = this.send<void>(
       { type: 'SEARCH_MESSAGES', filter },
-      onProgress,
+      { onSearchBatch: onBatch },
     );
-    return res.messages;
+    return {
+      requestId,
+      promise,
+      cancel: () => this.cancelTask(requestId),
+    };
   }
 
   async getMessageDetail(messageId: string): Promise<MessageDetail> {
     const res = await this.send<Extract<WorkerResponse, { type: 'MESSAGE_DETAIL' }>>({
       type: 'GET_MESSAGE_DETAIL',
       messageId,
-    });
+    }).promise;
     return res.detail;
   }
 
@@ -133,7 +217,7 @@ export class MailWorkerClient {
     const res = await this.send<Extract<WorkerResponse, { type: 'EML_EXPORTED' }>>({
       type: 'EXPORT_EML',
       messageId,
-    });
+    }).promise;
     return { filename: res.filename, bytes: res.bytes };
   }
 
@@ -143,20 +227,20 @@ export class MailWorkerClient {
   ): Promise<{ filename: string; bytes: Uint8Array }> {
     const res = await this.send<Extract<WorkerResponse, { type: 'FOLDER_ZIP_EXPORTED' }>>(
       { type: 'EXPORT_FOLDER_ZIP', folderId },
-      onProgress,
-    );
+      { onProgress },
+    ).promise;
     return { filename: res.filename, bytes: res.bytes };
   }
 
   /**
-   * Immediately terminates the existing worker (releasing all WASM/JS heap allocations)
-   * and spawns a clean fresh worker instance.
+   * Clears LRU block cache, resets worker state, terminates the worker to release all heap RAM,
+   * and spawns a clean worker instance.
    */
   async resetSession(): Promise<void> {
     try {
       await this.send<Extract<WorkerResponse, { type: 'SESSION_CLEARED' }>>({
         type: 'CLEAR_SESSION',
-      });
+      }).promise;
     } catch {
       // Proceed to terminate even if worker failed
     }
